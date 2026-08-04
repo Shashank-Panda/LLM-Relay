@@ -1,658 +1,129 @@
 # Relay
 
-> **An AI Gateway & Control Plane for Intelligent Multi-LLM Routing**
+> An AI gateway that puts one OpenAI-compatible API in front of many LLM providers, and decides which model should answer each request.
+
+Relay sits between your applications and every model vendor you use. Applications talk to it with the OpenAI SDK they already have; Relay normalizes the request, picks a model endpoint according to policy, executes the call with retries and failover, and streams the answer back in a single consistent format. Every decision it makes is recorded and explainable.
 
 ---
 
-# Vision
+## Status
 
-Relay is an AI Gateway that abstracts multiple LLM providers behind a single, provider-agnostic API.
+**Pre-implementation.** This repository currently contains design documentation only. No code has been written yet.
 
-Rather than simply forwarding requests to different providers, Relay acts as an intelligent decision engine that determines the optimal model based on factors such as:
-
-* Prompt characteristics
-* Provider capabilities
-* Cost
-* Latency
-* Context window
-* Reliability
-* Organization policies
-* Historical performance
-
-The long-term objective is to build infrastructure that could realistically be deployed inside an organization as the central platform for AI consumption.
+The architecture below is settled enough to build against. The [roadmap](docs/roadmap.md) describes what gets built in what order, and [`docs/adr/`](docs/adr/) records the decisions — including the ones still open.
 
 ---
 
-# Project Goals
+## Why this exists
 
-## Functional Goals
+Teams accumulate model vendors. Each one has its own SDK, its own streaming format, its own tool-calling schema, its own failure modes, and its own bill. The usual result is provider-specific code scattered across services, no consolidated view of spend, and no way to switch models without a deploy.
 
-* Unified API for multiple LLM providers
-* Intelligent prompt classification
-* Dynamic provider routing
-* Explainable routing decisions
-* Provider failover
-* Streaming support
-* Cost optimization
-* Observability
-* Enterprise-ready architecture
-
-## Non-Functional Goals
-
-* Extensible
-* Highly testable
-* Idiomatic Go
-* Provider agnostic
-* Easily configurable
-* Production-oriented
-* OpenAI-compatible API
-* Clean architecture
-* Low coupling
-* High cohesion
+Relay centralizes that. One endpoint, one request format, one set of metrics, one place where "which model handles this kind of work" is a configuration decision rather than a code change.
 
 ---
 
-# High-Level Architecture
+## Architecture at a glance
+
+Relay separates a stateless **data plane** that serves requests from a **control plane** that holds configuration and accounting. The data plane is the hot path and is designed to add single-digit milliseconds; the control plane is where tenants, budgets, credentials, and the model catalog live.
 
 ```
-                  Clients
-
-    CLI
-    VS Code
-    Slack
-    REST API
-    Future SDKs
-
-                │
-                ▼
-
-        API Gateway Layer
-
-                │
-
-                ▼
-
-      Request Validation
-
-                │
-
-                ▼
-
-      Prompt Classification
-
-                │
-
-                ▼
-
-       Prompt Analysis
-
-                │
-
-                ▼
-
-        Routing Engine
-
-                │
-
-                ▼
-
-     Policy Enforcement
-
-                │
-
-                ▼
-
-    Provider Selection
-
-                │
-
-                ▼
-
- Provider Abstraction Layer
-
-      ┌──────────────┐
-      │ OpenAI       │
-      │ Anthropic    │
-      │ Gemini       │
-      │ Ollama       │
-      │ Future       │
-      └──────────────┘
-
-                │
-
-                ▼
-
-      Streaming Response
-
-                │
-
-                ▼
-
-     Response Normalization
-
-                │
-
-                ▼
-
-              Client
+                         ┌──────────────────────────────────┐
+   OpenAI-compatible     │           DATA PLANE             │
+   clients ─────────────▶│                                  │
+   (any SDK, any lang)   │  auth ▸ limits ▸ validate ▸       │
+                         │  normalize                       │
+                         │            │                     │
+                         │            ▼                     │
+                         │  ┌──────────────────┐            │
+                         │  │ Router  (pure)   │◀── catalog │
+                         │  │ filter▸score▸rank│◀── policy  │
+                         │  └────────┬─────────┘◀── health  │
+                         │           │ Decision             │
+                         │           ▼                      │
+                         │  ┌──────────────────┐            │
+                         │  │ Executor         │            │
+                         │  │ retry / failover │            │
+                         │  │ circuit breaker  │            │
+                         │  └────────┬─────────┘            │
+                         │           │                      │
+                         │  ┌────────▼─────────┐            │
+                         │  │ Provider adapters│            │
+                         │  │ OpenAI Anthropic │            │
+                         │  │ Gemini  Ollama   │            │
+                         │  └────────┬─────────┘            │
+                         │           │                      │
+                         │   normalize ▸ stream ▸ meter     │
+                         └───────────┬──────────────────────┘
+                                     │ usage + decision records
+                         ┌───────────▼──────────────────────┐
+                         │          CONTROL PLANE           │
+                         │  tenants · API keys · budgets    │
+                         │  model catalog · routing policy  │
+                         │  provider credentials · audit    │
+                         │  admin API · analytics           │
+                         └──────────────────────────────────┘
 ```
 
----
+Two properties of this shape matter more than the boxes:
 
-# Core Components
+**Routing is a pure function.** `Router.Route(request, catalog, policy, health) → Decision` performs no I/O. It is a deterministic transformation of inputs to a ranked list with reasons attached, which makes it exhaustively testable and makes the explainability API free — the `Decision` *is* the explanation.
 
-## 1. API Gateway
+**Execution is separate from routing.** The `Executor` takes a `Decision` and carries it out, handling retries, failover between candidates, and streaming. Routing never knows about HTTP; execution never re-derives preferences.
 
-Responsibilities
-
-* Accept requests
-* Validate requests
-* Authentication
-* Streaming
-* Response normalization
-* Error handling
+See [`docs/architecture.md`](docs/architecture.md) for the full picture.
 
 ---
 
-## 2. Provider Abstraction Layer
+## How routing works
 
-Every provider should implement a common interface.
+Clients select behavior through the one field every OpenAI SDK exposes — `model`:
 
-Example:
+```jsonc
+{ "model": "gpt-4o-mini",        // a real model: pinned, routed straight through
+  "messages": [...] }
 
-* Chat
-* Streaming Chat
-* Embeddings
-* Images (future)
-* Audio (future)
+{ "model": "relay/fast-coder",   // a virtual model: a named route with candidates + policy
+  "messages": [...] }
 
-Goals
+{ "model": "relay/auto",         // classifier picks the task type, scorer picks the endpoint
+  "messages": [...] }
+```
 
-* Plug-and-play providers
-* Easy provider onboarding
-* No provider-specific logic outside adapters
+A virtual model names a **route**: a candidate list of model endpoints plus the weights used to score them. Routing then runs in two distinct phases — **filter** on hard constraints (context window, required capabilities, policy, credential availability, circuit state), then **score** the survivors on normalized, weighted preferences (cost, latency, quality, prompt-cache affinity).
 
----
+The routing unit is a *model endpoint* — `(provider, model, deployment, credential)` — not a provider. Routing "to Anthropic" is not a decision when Opus and Haiku differ by an order of magnitude in both cost and latency.
 
-## 3. Prompt Classification Engine
-
-Classify every prompt before routing.
-
-Possible outputs:
-
-* Task Type
-* Programming Language
-* Framework
-* Domain
-* Reasoning Complexity
-* Vision Requirement
-* Context Window Requirement
-* Estimated Tokens
-* Confidence Score
-* Streaming Recommendation
-
-Example task categories:
-
-* Code Generation
-* Code Review
-* Debugging
-* Refactoring
-* Architecture
-* Summarization
-* Translation
-* Research
-* Creative Writing
-* SQL
-* Data Analysis
-* Legal
-* Medical
-* OCR
-
-The classifier should evolve over time:
-
-V1
-
-* Rule-based
-
-V2
-
-* Rule + heuristics
-
-V3
-
-* Lightweight AI classifier
-
-V4
-
-* Self-improving classifier
+Full details, including a worked scoring example, are in [`docs/routing.md`](docs/routing.md).
 
 ---
 
-# Prompt Analysis
+## Documentation
 
-Estimate
-
-* Cost
-* Latency
-* Token usage
-* Temperature recommendation
-* Max token recommendation
-* Context length
-* Complexity
+| Document | Contents |
+|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | Component design, core types, streaming, reliability, state, SLOs |
+| [`docs/routing.md`](docs/routing.md) | Virtual models, the routing contract, scoring, the catalog, explainability |
+| [`docs/roadmap.md`](docs/roadmap.md) | Build order, and what is explicitly out of scope |
+| [`docs/adr/`](docs/adr/) | Architecture decision records, including open decisions |
 
 ---
 
-# Routing Engine
+## Stack
 
-The routing engine is the core of Relay.
-
-It should never contain provider-specific logic.
-
-Instead it receives structured metadata from the classifier.
-
-Example inputs:
-
-* Task type
-* Complexity
-* Estimated tokens
-* Required capabilities
-* User preferences
-* Organization policies
-
-The routing engine should score every provider.
-
-Possible scoring factors:
-
-Provider Quality
-
-* Coding quality
-* Reasoning quality
-* Vision quality
-* Long context capability
-* Tool calling support
-
-Performance
-
-* Live latency
-* Historical latency
-* Success rate
-* Failure rate
-
-Cost
-
-* Input token cost
-* Output token cost
-* Estimated request cost
-
-Context
-
-* Maximum context window
-* Streaming support
-
-Policies
-
-* Organization restrictions
-* Provider allow/block lists
-
-Preferences
-
-* User preference
-* Team preference
-
-The routing engine should return:
-
-* Selected provider
-* Final score
-* Provider rankings
-* Routing explanation
+Go · Chi · Viper · Zap · Postgres · Redis · Prometheus · OpenTelemetry · Docker
 
 ---
 
-# Explainable Routing
+## Design principles
 
-Every routing decision should be transparent.
-
-Example:
-
-Selected Provider
-
-Reason:
-
-* Coding Quality
-* Cost
-* Latency
-* Context
-* Policy
-
-Provider Rankings
-
-* Claude
-* GPT
-* Gemini
-
-Scoring breakdown
-
-This should be accessible via an API for debugging.
+- **Provider logic lives only in adapters.** Nothing above the adapter layer may branch on vendor name.
+- **Decisions are data.** Routing produces a struct, not a side effect.
+- **Configuration over code.** Adding a model, changing a route, or shifting cost weights is a config change.
+- **Interface-driven, with small interfaces.** A provider adapter should be implementable in an afternoon.
+- **The hot path stays cheap.** Anything that isn't required to answer the request happens off it.
 
 ---
 
-# Reliability
+## License
 
-Features
-
-* Retry mechanism
-* Exponential backoff
-* Circuit breaker
-* Health checks
-* Automatic provider failover
-* Request timeouts
-* Provider isolation
-* Recovery after health restoration
-
----
-
-# Streaming
-
-Support token streaming.
-
-Requirements
-
-* Provider-independent streaming
-* Response normalization
-* Graceful cancellation
-* Backpressure handling
-* Streaming metrics
-
----
-
-# Provider Management
-
-Support
-
-* Dynamic provider registration
-* Provider enable/disable
-* Model mapping
-* Default provider
-* Provider priority
-* Provider capability registry
-
----
-
-# Caching
-
-Possible cache layers
-
-* Prompt hash cache
-* Response cache
-* Redis cache
-* Semantic cache (future)
-
-Metrics
-
-* Cache hits
-* Cache misses
-* Hit ratio
-
----
-
-# Observability
-
-Metrics
-
-* Request count
-* Token usage
-* Cost
-* Latency
-* TTFT
-* Streaming duration
-* Provider usage
-* Provider failures
-* Retry count
-* Cache metrics
-
-Logging
-
-* Request logs
-* Provider logs
-* Routing logs
-* Error logs
-
-Tracing
-
-* Request lifecycle
-* Provider calls
-* Routing decisions
-
-Integrations
-
-* Prometheus
-* Grafana
-* OpenTelemetry
-
----
-
-# Learning & Analytics
-
-Store historical routing information.
-
-Metrics
-
-* Provider success rate
-* Provider latency
-* Provider cost
-* Provider usage
-* User feedback
-
-Future goal
-
-Allow routing to improve using historical data instead of static rules.
-
----
-
-# Multi-Provider Strategies
-
-Future support
-
-* Parallel execution
-* Fastest response wins
-* Consensus routing
-* Majority voting
-* Best-answer selection
-* Response merging
-
----
-
-# Enterprise Features
-
-Authentication
-
-* API Keys
-* JWT
-* OAuth
-
-Authorization
-
-* RBAC
-
-Organization Support
-
-* Teams
-* Organizations
-* User quotas
-
-Budgets
-
-* Daily budget
-* Monthly budget
-
-Policies
-
-* Provider restrictions
-* PII rules
-* Cost policies
-
-Audit Logs
-
-Track
-
-* User
-* Time
-* Provider
-* Tokens
-* Cost
-
----
-
-# Security
-
-* Prompt sanitization
-* Secret detection
-* Secret masking
-* PII detection
-* Request validation
-* Input limits
-* Output filtering
-
----
-
-# Configuration
-
-Configuration should support
-
-* YAML
-* Environment variables
-* Runtime reload
-* Routing policies
-* Provider configuration
-* Feature flags
-
----
-
-# Developer Experience
-
-* Docker
-* Docker Compose
-* GitHub Actions
-* Swagger/OpenAPI
-* Postman Collection
-* Unit Tests
-* Integration Tests
-* Mock Providers
-
----
-
-# Deployment
-
-Initial
-
-* Local Docker
-
-Later
-
-* Cloud Run
-* Fly.io
-* Render
-
-Eventually
-
-* Kubernetes
-
----
-
-# Technology Stack
-
-Language
-
-* Go
-
-HTTP
-
-* Chi
-
-Configuration
-
-* Viper
-
-Logging
-
-* Zap
-
-Caching
-
-* Redis
-
-Metrics
-
-* Prometheus
-
-Tracing
-
-* OpenTelemetry
-
-Documentation
-
-* Swagger/OpenAPI
-
-Testing
-
-* Go Testing
-* Table-driven tests
-
-Containerization
-
-* Docker
-
-CI/CD
-
-* GitHub Actions
-
----
-
-# Design Principles
-
-* Clean Architecture
-* SOLID Principles
-* Dependency Inversion
-* Interface-driven design
-* Composition over inheritance
-* Provider independence
-* Configuration over hardcoding
-* High cohesion
-* Low coupling
-
----
-
-# Explicit Non-Goals (Initial Versions)
-
-The following are intentionally out of scope for early iterations:
-
-* RAG
-* Vector databases
-* Agent frameworks
-* Workflow automation
-* Fine-tuning models
-* Custom LLM training
-* Frontend dashboard (until backend is mature)
-
----
-
-# Questions for Architecture Review
-
-Please review this architecture critically as if you were a Principal Engineer or Staff Engineer responsible for approving it for production.
-
-Specifically evaluate:
-
-1. Overall architecture and separation of concerns.
-2. Extensibility for adding new providers and routing strategies.
-3. Scalability under high request volume.
-4. Concurrency model and potential bottlenecks.
-5. Streaming architecture.
-6. Reliability and fault tolerance.
-7. Testability of each component.
-8. Configuration management.
-9. Any unnecessary complexity or over-engineering.
-10. Missing components required for a production-grade AI Gateway.
-11. Alternative architectural approaches and their trade-offs.
-12. Recommended implementation order to maximize learning while minimizing rework.
-
-Provide brutally honest feedback and suggest improvements before any implementation begins.
+Not yet chosen.
