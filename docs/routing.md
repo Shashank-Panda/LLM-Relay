@@ -105,7 +105,11 @@ routes:
       - anthropic/claude-sonnet-5@us-east
       - openai/gpt-4o-mini@us-east
       - google/gemini-flash@us-central
-    baseline: anthropic/claude-opus-5@us-east # priced against this to compute savings
+      - ollama/qwen-coder@local
+    # Priced against this to compute savings. The baseline is always evaluated
+    # as a candidate too, whether or not it appears above — serving what the
+    # caller asked for must never be an option the router removed from itself.
+    baseline: anthropic/claude-opus-5@us-east
     require:
       - capability: tools
       - quality.coding: ">= 0.60" # hard floor; below this is eliminated, not down-ranked
