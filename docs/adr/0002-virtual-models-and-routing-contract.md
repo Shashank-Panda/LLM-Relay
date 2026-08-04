@@ -1,7 +1,9 @@
 # ADR-0002 — Virtual models carry routing intent through the `model` field
 
-**Status:** Accepted
+**Status:** Accepted — **amended by [ADR-0007](0007-requested-model-as-baseline.md)**
 **Date:** 2026-08-04
+
+> **Amendment.** This ADR states that an explicitly requested model is an absolute pin. ADR-0007 narrows that: under opt-in optimization mode a requested model becomes a **baseline and ceiling**, and Relay may serve something cheaper that clears the quality floor, disclosing the swap on every affected response. The underlying rule — *never substitute silently* — is unchanged, and `X-Relay-Pin: strict` restores the behavior described below. Read this ADR for the contract; read ADR-0007 for how consented substitution fits inside it.
 
 ## Context
 

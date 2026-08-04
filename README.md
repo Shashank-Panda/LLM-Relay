@@ -1,8 +1,10 @@
 # Relay
 
-> An AI gateway that puts one OpenAI-compatible API in front of many LLM providers, and decides which model should answer each request.
+> **Cut your LLM bill without changing your code.** Point your OpenAI SDK at Relay, keep calling the models you already call, and Relay serves each request from the cheapest option that still meets your quality bar — then shows you exactly what it saved.
 
-Relay sits between your applications and every model vendor you use. Applications talk to it with the OpenAI SDK they already have; Relay normalizes the request, picks a model endpoint according to policy, executes the call with retries and failover, and streams the answer back in a single consistent format. Every decision it makes is recorded and explainable.
+Relay is an AI gateway that sits between your applications and your model providers. Applications talk to it with the OpenAI SDK they already have, sending the model names they already send. Relay normalizes the request, optimizes it, routes it to the cheapest endpoint that clears the quality floor, and streams the answer back unchanged in shape.
+
+The two things that make it a product rather than a proxy: **it never substitutes silently** — every swap is disclosed in response headers with the saving attached — and **it measures the counterfactual**, so "we cut your spend 38%" is a number you can audit rather than a claim you have to believe.
 
 ---
 
@@ -10,21 +12,67 @@ Relay sits between your applications and every model vendor you use. Application
 
 **Pre-implementation.** This repository currently contains design documentation only. No code has been written yet.
 
-The architecture below is settled enough to build against. The [roadmap](docs/roadmap.md) describes what gets built in what order, and [`docs/adr/`](docs/adr/) records the decisions — including the ones still open.
+The [roadmap](docs/roadmap.md) describes what gets built in what order; [`docs/adr/`](docs/adr/) records the decisions, including the ones still open.
 
 ---
 
-## Why this exists
+## The problem
 
-Teams accumulate model vendors. Each one has its own SDK, its own streaming format, its own tool-calling schema, its own failure modes, and its own bill. The usual result is provider-specific code scattered across services, no consolidated view of spend, and no way to switch models without a deploy.
+A team standardizes on a strong model because it was the safe choice during development. Then production traffic arrives, and most of it turns out to be easy — short classifications, formatting, extraction, routine tool calls — all being served by a frontier model at frontier prices. Meanwhile the reasoning budget is set high globally because nobody wanted to tune it per call site, prompt caching is left on the table because inserting breakpoints correctly is fiddly, and `max_tokens` is set to whatever the example used.
 
-Relay centralizes that. One endpoint, one request format, one set of metrics, one place where "which model handles this kind of work" is a configuration decision rather than a code change.
+Every one of those is a real, recoverable cost. None of them get fixed, because fixing them means auditing hundreds of call sites, and nobody can prove in advance that the cheaper option is good enough.
+
+Relay makes those decisions per request, at the gateway, with the evidence attached.
+
+---
+
+## Where the savings come from
+
+Model substitution is only part of it. Relay pulls four levers:
+
+| Lever | What it does | Typical saving |
+|---|---|---|
+| **Model downgrade** | Serve an easy request from a cheaper endpoint that clears the quality floor | Large, highly traffic-dependent |
+| **Prompt-cache activation** | Insert cache breakpoints automatically, and keep sessions on the endpoint holding the warm cache | Up to ~90% of repeated input cost |
+| **Effort and ceiling tuning** | Downshift reasoning/thinking budgets and cap `max_tokens` to observed p95 | Large on reasoning models |
+| **Response cache** | Return the stored answer for an identical request | 100% on hits |
+
+The second one is worth calling out because it is the least visible and often the largest: providers charge a fraction of the normal input price to read a cached prompt prefix, but only if breakpoints are placed correctly and the conversation keeps hitting the same endpoint. Relay does both. A naive cost-optimizing router that ignores cache affinity will migrate a conversation to a "cheaper" model and increase the bill.
+
+---
+
+## How adoption works
+
+```diff
+- base_url = "https://api.openai.com/v1"
++ base_url = "https://relay.example.com/v1"
+```
+
+That is the whole integration. Keep sending `model: "gpt-4o"`.
+
+Relay treats the model you asked for as a **baseline and a ceiling**: it will not serve you something above it, and it will serve you something below it only when the request clears your quality floor. Every response tells you what actually happened:
+
+```http
+X-Relay-Served:     openai/gpt-4o-mini@us-east
+X-Relay-Baseline:   openai/gpt-4o@us-east
+X-Relay-Cost-Usd:   0.000210
+X-Relay-Baseline-Usd: 0.003480
+X-Relay-Saved-Usd:  0.003270
+```
+
+Three ways to stay in control:
+
+- **`X-Relay-Pin: strict`** on any request — served exactly as asked, no optimization. Always honored.
+- **Shadow mode** — Relay serves exactly what you asked for and only *reports* what it would have saved. Run it for a week before enabling anything.
+- **Quality floor** — a hard constraint, not a preference. Endpoints below it are eliminated, never merely ranked lower.
+
+See [ADR-0007](docs/adr/0007-requested-model-as-baseline.md) for why substitution is opt-in and always disclosed.
 
 ---
 
 ## Architecture at a glance
 
-Relay separates a stateless **data plane** that serves requests from a **control plane** that holds configuration and accounting. The data plane is the hot path and is designed to add single-digit milliseconds; the control plane is where tenants, budgets, credentials, and the model catalog live.
+Relay separates a stateless **data plane** on the hot path from a **control plane** holding configuration and accounting.
 
 ```
                          ┌──────────────────────────────────┐
@@ -35,18 +83,24 @@ Relay separates a stateless **data plane** that serves requests from a **control
                          │            │                     │
                          │            ▼                     │
                          │  ┌──────────────────┐            │
+                         │  │ Optimizer        │            │
+                         │  │ cache breakpoints│            │
+                         │  │ effort / ceilings│            │
+                         │  └────────┬─────────┘            │
+                         │           ▼                      │
+                         │  ┌──────────────────┐            │
                          │  │ Router  (pure)   │◀── catalog │
                          │  │ filter▸score▸rank│◀── policy  │
                          │  └────────┬─────────┘◀── health  │
-                         │           │ Decision             │
+                         │           │ Decision + Baseline  │
                          │           ▼                      │
                          │  ┌──────────────────┐            │
                          │  │ Executor         │            │
                          │  │ retry / failover │            │
-                         │  │ circuit breaker  │            │
+                         │  │ cascade escalate │            │
                          │  └────────┬─────────┘            │
-                         │           │                      │
-                         │  ┌────────▼─────────┐            │
+                         │           ▼                      │
+                         │  ┌──────────────────┐            │
                          │  │ Provider adapters│            │
                          │  │ OpenAI Anthropic │            │
                          │  │ Gemini  Ollama   │            │
@@ -54,46 +108,35 @@ Relay separates a stateless **data plane** that serves requests from a **control
                          │           │                      │
                          │   normalize ▸ stream ▸ meter     │
                          └───────────┬──────────────────────┘
-                                     │ usage + decision records
+                                     │ usage + savings + decisions
                          ┌───────────▼──────────────────────┐
                          │          CONTROL PLANE           │
                          │  tenants · API keys · budgets    │
                          │  model catalog · routing policy  │
-                         │  provider credentials · audit    │
+                         │  savings ledger · audit          │
                          │  admin API · analytics           │
                          └──────────────────────────────────┘
 ```
 
-Two properties of this shape matter more than the boxes:
+Three properties matter more than the boxes:
 
-**Routing is a pure function.** `Router.Route(request, catalog, policy, health) → Decision` performs no I/O. It is a deterministic transformation of inputs to a ranked list with reasons attached, which makes it exhaustively testable and makes the explainability API free — the `Decision` *is* the explanation.
+**Routing is a pure function.** `Router.Route(request, catalog, policy, health) → Decision` performs no I/O. It is a deterministic transformation of inputs into a ranked list with reasons attached, which makes it exhaustively testable and makes the explainability API free — the `Decision` *is* the explanation.
 
-**Execution is separate from routing.** The `Executor` takes a `Decision` and carries it out, handling retries, failover between candidates, and streaming. Routing never knows about HTTP; execution never re-derives preferences.
+**Execution is separate from routing.** The `Executor` takes a `Decision` and carries it out: retries, failover, cascade escalation, streaming. Routing never knows about HTTP; execution never re-derives preferences.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full picture.
+**Every request records both costs.** What it cost, and what the baseline would have cost. That difference is the product.
+
+Full detail in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
-## How routing works
+## Deployment
 
-Clients select behavior through the one field every OpenAI SDK exposes — `model`:
+**Hosted SaaS** is the default: point at Relay's endpoint, bring your own provider keys. Relay never fronts your provider spend and never retains prompt content.
 
-```jsonc
-{ "model": "gpt-4o-mini",        // a real model: pinned, routed straight through
-  "messages": [...] }
+**Self-hosted** for regulated or high-sensitivity environments: run the same binary in your own VPC, prompts never leave your network. Same control plane, same admin API.
 
-{ "model": "relay/fast-coder",   // a virtual model: a named route with candidates + policy
-  "messages": [...] }
-
-{ "model": "relay/auto",         // classifier picks the task type, scorer picks the endpoint
-  "messages": [...] }
-```
-
-A virtual model names a **route**: a candidate list of model endpoints plus the weights used to score them. Routing then runs in two distinct phases — **filter** on hard constraints (context window, required capabilities, policy, credential availability, circuit state), then **score** the survivors on normalized, weighted preferences (cost, latency, quality, prompt-cache affinity).
-
-The routing unit is a *model endpoint* — `(provider, model, deployment, credential)` — not a provider. Routing "to Anthropic" is not a decision when Opus and Haiku differ by an order of magnitude in both cost and latency.
-
-Full details, including a worked scoring example, are in [`docs/routing.md`](docs/routing.md).
+Relay is a hard dependency in your critical path, so it is built to **fail open**: if Relay is degraded, requests pass through to the baseline model unrouted rather than failing. Being unable to optimize must never mean being unable to serve.
 
 ---
 
@@ -101,8 +144,8 @@ Full details, including a worked scoring example, are in [`docs/routing.md`](doc
 
 | Document | Contents |
 |---|---|
-| [`docs/architecture.md`](docs/architecture.md) | Component design, core types, streaming, reliability, state, SLOs |
-| [`docs/routing.md`](docs/routing.md) | Virtual models, the routing contract, scoring, the catalog, explainability |
+| [`docs/architecture.md`](docs/architecture.md) | Components, core types, optimizer, streaming, reliability, state, SLOs |
+| [`docs/routing.md`](docs/routing.md) | Baseline semantics, quality floor, scoring, catalog, savings accounting |
 | [`docs/roadmap.md`](docs/roadmap.md) | Build order, and what is explicitly out of scope |
 | [`docs/adr/`](docs/adr/) | Architecture decision records, including open decisions |
 
@@ -116,11 +159,12 @@ Go · Chi · Viper · Zap · Postgres · Redis · Prometheus · OpenTelemetry ·
 
 ## Design principles
 
-- **Provider logic lives only in adapters.** Nothing above the adapter layer may branch on vendor name.
+- **Never substitute silently.** Every swap is disclosed, every saving is attributable, `strict` is always honored.
+- **Quality is a floor, not a preference.** Cost optimization that degrades output is not a saving.
+- **Prove the saving.** A cost-reduction product that cannot measure the counterfactual is asking for trust it hasn't earned.
+- **Provider logic lives only in adapters.** Nothing above the adapter layer branches on vendor name.
 - **Decisions are data.** Routing produces a struct, not a side effect.
-- **Configuration over code.** Adding a model, changing a route, or shifting cost weights is a config change.
-- **Interface-driven, with small interfaces.** A provider adapter should be implementable in an afternoon.
-- **The hot path stays cheap.** Anything that isn't required to answer the request happens off it.
+- **Fail open.** Degraded optimization beats a failed request.
 
 ---
 

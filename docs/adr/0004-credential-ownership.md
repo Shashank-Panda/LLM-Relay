@@ -1,7 +1,9 @@
 # ADR-0004 — Who owns provider API keys
 
-**Status:** **OPEN** — deliberately undecided
+**Status:** **OPEN — narrowed toward BYOK**
 **Date:** 2026-08-04
+
+> **Update.** Relay is now positioned as a hosted service with a self-hosted enterprise option. That does not close this ADR, but it narrows it sharply: as a vendor, holding pooled provider keys would mean fronting customers' model spend, carrying the float, and absorbing the fraud and abuse exposure of strangers' traffic — for a product whose margin is a gateway fee, not a markup on tokens. Option A (BYOK) is now the presumptive answer and Option B is close to excluded. It stays open because the migration path to C, and the handling of self-hosted installs where the distinction partly dissolves, are not yet settled.
 
 ## Context
 

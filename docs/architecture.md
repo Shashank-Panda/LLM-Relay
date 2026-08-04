@@ -19,6 +19,25 @@ The two communicate in exactly two directions:
 
 Keeping this boundary sharp is what allows the data plane to be scaled horizontally and restarted freely, and it is why a slow Postgres cannot take down inference traffic.
 
+### Deployment topologies
+
+The same binary serves both shapes, which is why the boundary has to be clean from the start rather than retrofitted.
+
+**Hosted SaaS** (the default). Relay runs the data plane and control plane; tenants supply their own provider credentials. Relay never fronts provider spend, which keeps it out of the payments business and out of the fraud-exposure business. This is what pushes [ADR-0004](adr/0004-credential-ownership.md) toward BYOK.
+
+**Self-hosted** (regulated and high-sensitivity customers). Both planes run inside the customer's network; prompts never leave it. The control plane is the same admin API and the same Postgres schema. What changes is who operates it and where the catalog updates come from — Relay publishes signed catalog snapshots that self-hosted installs pull, so pricing and model additions do not require a customer deploy.
+
+The design constraint this imposes: **no data-plane feature may depend on Relay-operated infrastructure that a customer cannot run.** Anything that would only work in the hosted environment is a control-plane feature or it does not exist.
+
+### Data handling
+
+Prompts are the most sensitive data a customer will ever hand a vendor, and Relay is in the path of all of them.
+
+- **Prompt and response content is not persisted.** It exists in memory for the life of the request and is not written to logs, traces, or the database. This is a default and a product commitment, not a configuration flag someone might forget to set.
+- **Metering records carry token counts and costs, never content.**
+- **Body capture is opt-in per tenant**, time-boxed, redacted for secrets, and carries an explicit retention window. It exists for debugging, at the customer's request.
+- **Data residency is a routing constraint** (`Policy.DataResidency`), enforced in the filter phase — an endpoint in the wrong region is eliminated, not down-ranked.
+
 ---
 
 ## 2. Request lifecycle
@@ -34,18 +53,61 @@ HTTP request
   ├─ decode + validate       → 400 early, before any expensive work
   │                            (max body size enforced here, not after parsing)
   ├─ normalize               → NormalizedRequest (provider-neutral)
+  ├─ resolve baseline        → Baseline{endpoint, mode: strict|shadow|optimize}
   ├─ policy pre-check        → budget available? model permitted?
+  │
+  ├─ Optimizer.Apply(...)    → cache breakpoints, effort, ceilings (records deltas)
   │
   ├─ Router.Route(...)       → Decision (pure, no I/O)
   │
-  ├─ Executor.Execute(...)   → attempts, retries, failover, streaming
+  ├─ Executor.Execute(...)   → attempts, retries, failover, cascade escalation
   │     └─ Adapter.Chat / Adapter.ChatStream → provider HTTP
   │
   ├─ denormalize             → OpenAI-shaped response or SSE stream
-  └─ meter                   → usage + decision record queued (async)
+  └─ meter                   → usage + baseline cost + decision queued (async)
 ```
 
-Two things are deliberately *not* in this chain. There is no synchronous classification stage — classification is an input the router may request for `auto` routes, bounded and cached (see [routing](routing.md#classification) and [ADR-0006](adr/0006-classifier-placement.md)). And there is no synchronous write to durable storage; metering is queued.
+Two things are deliberately *not* in this chain. There is no synchronous classification stage — classification is a bounded, cached input the router may request (see [routing §9](routing.md#9-classification) and [ADR-0006](adr/0006-classifier-placement.md)). And there is no synchronous write to durable storage; metering is queued.
+
+### Baseline resolution
+
+Every request resolves to a **baseline endpoint** — the thing the caller would have got without Relay — and a mode:
+
+| Mode | Behavior |
+|---|---|
+| `strict` | Serve the baseline. No optimization, no substitution. Set by `X-Relay-Pin: strict`, or by a tenant with optimization disabled. |
+| `shadow` | Serve the baseline, but route and price the counterfactual anyway and record what *would* have been saved. |
+| `optimize` | Route freely below the baseline, subject to the quality floor. |
+
+The baseline is what makes savings measurable: `saving = baseline_cost − actual_cost`, computed per request from the same token counts priced two ways. Without a baseline there is no counterfactual, and without a counterfactual the product's central claim is unverifiable. This is why baseline resolution is a first-class pipeline stage rather than an analytics afterthought — it has to be right at request time, when the information exists.
+
+When a caller sends a virtual model (`relay/fast-coder`) rather than a real one, the baseline is the route's declared `baseline` endpoint. A route with no baseline reports no saving rather than reporting zero — an unmeasured saving and a measured saving of zero are different facts and must not be aggregated together.
+
+### The Optimizer
+
+`Optimizer.Apply` transforms the request before routing sees it. It is separate from the Router because it changes *the request*, whereas the Router chooses *the endpoint* — different inputs, different outputs, independently testable.
+
+```go
+type Optimizer interface {
+    // Returns a possibly-modified request and the list of adjustments made.
+    // Must be deterministic: same inputs, same output.
+    Apply(req *NormalizedRequest, pol *Policy, stats *RouteStats) (*NormalizedRequest, []Optimization)
+}
+
+type Optimization struct {
+    Lever  string   // cache_breakpoints | effort | max_tokens | context_prune
+    Before string
+    After  string
+    Reason string
+}
+```
+
+Its levers and the rules that bound them are specified in [routing §6](routing.md#6-request-optimization). Two architectural properties matter here:
+
+- **Deterministic and pure**, like the Router. It reads `RouteStats` (a snapshot of observed output lengths and cache-hit rates) but performs no I/O, so it is table-testable.
+- **Adjustments are data**, carried in the `Decision` and surfaced in dry-run and response headers. An optimization the customer cannot see is indistinguishable from a bug.
+
+The highest-value lever is cache breakpoint insertion, and it is worth being explicit about why it belongs here rather than in the adapters: breakpoint *placement* is a decision about the request's stable prefix structure, which is provider-neutral. Only the *encoding* of a breakpoint is provider-specific, and that stays in the adapter.
 
 ---
 
@@ -71,8 +133,14 @@ NormalizedRequest
   Params        SamplingParams     // temperature, top_p, max_tokens, stop, seed, ...
   Stream        bool
   SessionKey    string             // optional; drives prompt-cache affinity
+  Baseline      Baseline           // resolved endpoint + mode; see §2
   Estimate      Estimate           // approximate input tokens, approximate output tokens
   Metadata      map[string]string
+
+Baseline
+  EndpointID    string             // what the caller would have got without Relay
+  Mode          BaselineMode       // strict | shadow | optimize
+  Source        string             // explicit_model | route_default | tenant_default
 ```
 
 `Estimate` is explicitly approximate — see [§8](#8-token-and-cost-estimation).
@@ -119,9 +187,16 @@ Policy                              // tenant/org scoped, layered over the route
   MaxCostPerRequest  Money
   DataResidency      []Region
   AllowPromptLogging bool
+
+  OptimizationMode   BaselineMode   // strict | shadow | optimize — default strict
+  QualityFloor       map[string]float64  // per dimension; hard filter, not a weight
+  Levers             LeverConfig    // which optimizations are enabled
+  AllowEscalation    bool           // cascade retry on validity failure
 ```
 
-Policy may **reject** a candidate. It may not silently substitute one. If policy forbids what the caller explicitly pinned, the request fails with a clear error rather than quietly answering from a different model — a caller who pinned a model and got another one has been lied to.
+Policy may **reject** a candidate. It may not silently substitute one. If policy forbids what the caller asked for, the request fails with a clear error rather than quietly answering from a different model.
+
+`OptimizationMode` is the one exception, and it is not really an exception: substitution under optimization mode is something the tenant switched on, is bounded below the model they named, and is disclosed on every affected response. Consented and visible is a different thing from silent. Defaulting it to `strict` means the exception is never taken by accident. See [ADR-0007](adr/0007-requested-model-as-baseline.md).
 
 ### Decision
 
@@ -135,6 +210,8 @@ Decision
   Ranked       []ScoredCandidate    // ordered best-first
   Rejected     []RejectedCandidate  // endpoint + constraint that eliminated it
   Chosen       string               // endpoint ID
+  Baseline     Baseline             // what the caller asked for, and the mode
+  Optimizations []Optimization      // request-level adjustments applied
   Classification *Classification    // present only if classification ran
   Deterministic bool
 
@@ -147,7 +224,8 @@ ScoredCandidate
 RejectedCandidate
   EndpointID string
   Reason     RejectReason           // ContextTooSmall | MissingCapability | PolicyDenied |
-                                    // NoCredential | CircuitOpen | BudgetExceeded | Deprecated
+                                    // NoCredential | CircuitOpen | BudgetExceeded | Deprecated |
+                                    // BelowQualityFloor | AboveBaseline
   Detail     string
 ```
 
@@ -170,11 +248,25 @@ Usage
   CachedInputTokens  int
   OutputTokens       int
   ReasoningTokens    int
-  Cost               Money          // computed from actual usage × endpoint pricing
+  Cost               Money          // actual usage × served endpoint pricing
   Estimated          bool           // true if the provider returned no usage block
+
+  BaselineCost       Money          // same token counts × baseline endpoint pricing
+  Saved              Money          // BaselineCost − Cost; negative when escalated
+  SavingMeasured     bool           // false when no baseline existed to compare against
+  Escalated          bool           // cascade retry occurred; Cost covers all attempts
+  CacheHit           bool           // served from response cache; Cost is zero
 ```
 
 `Usage` comes from the provider's reported numbers wherever available. Estimates are for admission control only; billing and budget enforcement use actuals.
+
+**`BaselineCost` is the product.** It prices the same request against the endpoint the caller named, so that `Saved` is a per-request fact rather than a modelled aggregate. Three honesty constraints on it:
+
+- Input-token baseline is exact — the same tokens, different price.
+- Output-token baseline is an approximation, since a different model would have produced a different number of tokens. Relay prices the *actual* output count at baseline rates and documents this rather than modelling a hypothetical length.
+- `SavingMeasured: false` when no baseline exists (a virtual route with none declared). Unmeasured is not zero, and the two must never be summed together.
+
+Escalated requests accumulate the cost of every attempt against a single baseline, producing a negative `Saved`. A savings ledger that quietly excluded its own failures would be measuring the wrong thing.
 
 ---
 
@@ -253,7 +345,29 @@ Retry policy without error classification burns money. Every provider error is m
 - Each attempt has its own timeout; the request has a total deadline. Retries consume the total deadline and stop when it would be exceeded.
 - Non-streaming retries carry an idempotency key where the provider supports one.
 - `MaxAttempts` is per route and bounded. Every attempt is a real charge.
-- Hedging (starting a second attempt before the first fails) is **not** implemented. It doubles spend for a latency improvement, and if it is ever added it must be opt-in per route with the cost consequence documented at the config site.
+- Hedging (starting a second attempt before the first fails) is **not** implemented. It doubles spend on every request to improve a tail, which is the exact inverse of this product.
+
+### Cascade escalation
+
+The safety net under model downgrading. When a downgraded endpoint returns a response that fails a cheap, objective validity check, the Executor retries on the baseline endpoint.
+
+Validity checks, all of which are cheap and none of which require judgment:
+
+| Check | Applies when |
+|---|---|
+| Empty or whitespace-only completion | always |
+| Response body does not parse as JSON | `response_format: json_object` |
+| Response violates the declared schema | `response_format: json_schema` |
+| Tool call arguments do not parse, or name an undeclared tool | `tools` present |
+| Refusal or safety stop on a request the baseline would accept | always, heuristic |
+
+Rules:
+
+- **Sequential.** The second call happens only when the first actually failed — unlike hedging, which pays twice always.
+- **One escalation per request**, to the baseline endpoint, never a chain.
+- **Cost is recorded across all attempts** against a single baseline, so an escalated request has a negative `Saved`.
+- **Streaming caveat.** Escalation is subject to the same first-byte boundary as failover ([§5](#5-streaming)). Validity checks that need the complete response can only run pre-flush, so on streaming requests only checks decidable from the first chunks apply. Routes that depend on full-response validation should either disable streaming or accept the reduced coverage — this is a real limitation, not a detail.
+- **Escalation rate feeds back.** Sustained escalation on an endpoint revises its effective quality downward, so routing stops selecting it without waiting for anyone to read a dashboard.
 
 ### Circuit breaker
 
@@ -262,6 +376,26 @@ Per `(endpoint, credential)`. Closed → open on an error-rate threshold over a 
 ### Load shedding
 
 Bounded in-flight concurrency per endpoint and globally, with a bounded queue and a queue deadline. When the queue is full, shed with `503` and `Retry-After` rather than accepting work that will time out anyway. Streaming connections are counted separately from non-streaming ones: they are long-lived and cheap in CPU but expensive in file descriptors and memory.
+
+### Fail-open passthrough
+
+As a hosted service, Relay is a hard dependency in the customer's critical path. Its availability multiplies into theirs, and a gateway whose *optional* function is optimization must never make its *mandatory* function — delivering a response — conditional on the optional one.
+
+So every internal failure degrades toward passthrough rather than toward an error:
+
+| Failure | Behavior |
+|---|---|
+| Optimizer panics or exceeds its budget | Route the unmodified request |
+| Classification unavailable or slow | Route with default weights |
+| Catalog snapshot stale or unloadable | Serve from the last good snapshot |
+| Control plane / Postgres unreachable | Serve; buffer usage records, spill to disk |
+| Redis unreachable | Rate limits fail **open**, budgets fail **closed** |
+| Routing produces no viable candidate | Serve the baseline endpoint directly |
+| Savings ledger write fails | Serve; the record is lost, the request is not |
+
+The general rule: **the only failures that may surface to the caller are failures of the provider call itself.** Everything Relay adds is degradable.
+
+The exceptions are deliberate and narrow. Budgets fail closed because failing open on a spend control means unbounded spend, which is worse than a failed request. Policy denials fail closed because a policy that stops applying under load is not a policy. Both are stated here so that "fail open" is not mistaken for "fail open at all times."
 
 ### Graceful shutdown
 
@@ -312,8 +446,13 @@ The consequence: estimates are for **admission control and routing** only — is
 - `relay_ttft_seconds{endpoint}`
 - `relay_tokens_total{endpoint,kind}` where kind ∈ input, cached_input, output, reasoning
 - `relay_cost_usd_total{tenant,endpoint}`
+- `relay_baseline_cost_usd_total{tenant}` and `relay_saved_usd_total{tenant}` — the product's headline numbers, and the pair that must reconcile against the savings ledger
+- `relay_substitutions_total{tenant,baseline,served}` — how often a downgrade happened, and to what
+- `relay_escalations_total{tenant,from,check}` — the counter that tells you a downgrade was wrong. A rising escalation rate is the earliest signal of quality regression, and it should page before a customer notices.
+- `relay_optimizations_total{lever}` and `relay_cache_breakpoints_inserted_total`
 - `relay_attempts_total{endpoint,error_class}`, `relay_circuit_state{endpoint}`
 - `relay_cache_hits_total`, `relay_shed_total`, `relay_streams_active`
+- `relay_degraded_total{component}` — every fail-open path taken. Passthrough is silent by design, so without this metric the system can be quietly not optimizing anything and still look healthy.
 
 **Tracing** (OpenTelemetry). One span per request, child spans for route, each attempt, and each provider call. Attempt spans carry endpoint, error class, and token counts, which makes a failover chain readable at a glance.
 
@@ -345,13 +484,20 @@ Numbers, so that "is this fast enough" is answerable:
 |---|---|
 | Gateway overhead (excludes provider time), p50 | < 5 ms |
 | Gateway overhead, p99 | < 25 ms |
+| Optimizer budget, p99 | < 3 ms — exceeded means passthrough, never delay |
 | Added TTFT overhead on streaming, p99 | < 15 ms |
-| Availability of the data plane | 99.9% monthly |
+| **Availability of the data plane** | **99.95% monthly** |
 | Concurrent streams per instance | 2,000 |
 | Non-streaming throughput per instance | 1,000 rps at the overhead targets above |
 | Control plane unavailability impact on data plane | None — serves from last good snapshot |
+| Escalation rate per route | < 2% — above this, the downgrade policy is wrong |
+| Savings ledger reconciliation vs. provider invoice | within 1% monthly |
 
-That last row is a requirement, not an aspiration: if Postgres being down stops inference, the plane separation has failed.
+Two of these deserve comment.
+
+**99.95%, not 99.9%.** A self-hosted gateway can justify three nines because the operator owns the trade. A hosted service in a customer's critical path cannot: their availability becomes yours multiplied by theirs, and you are asking them to accept a new single point of failure in exchange for a cost saving. Fail-open passthrough is what makes this reachable — most Relay failures should degrade to "expensive but working" rather than to downtime.
+
+**Control plane unavailability having no data-plane impact** is a requirement, not an aspiration. If Postgres being down stops inference, the plane separation has failed and there was no point building it.
 
 ---
 
