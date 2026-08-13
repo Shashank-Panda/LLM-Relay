@@ -10,13 +10,13 @@ The consequence is that **shadow mode ships before substitution does**, and **op
 
 ---
 
-## Phase 1 — Vertical slice (passthrough gateway)
+## Phase 1 — Vertical slice (passthrough gateway) — **built, pending live verification**
 
-**Goal: one request goes end to end, streaming and not, against two real providers. No optimization, no routing.**
+**Goal: one request goes end to end, streaming and not, against real providers. No optimization, no routing.**
 
 - `POST /v1/chat/completions`, streaming and non-streaming
 - `GET /v1/models`, `/healthz`, `/readyz`
-- Two adapters: **Ollama** (free, local, fast to iterate against) and one paid provider
+- Three adapters: **Ollama** (free, local, fast to iterate against), **OpenAI**, and **Anthropic**
 - Static YAML catalog at boot; **`strict` mode only** — serve exactly what was asked
 - Baseline resolution wired in, even though everything is `strict` — the type exists from day one
 - Normalization and denormalization including tool calls; SSE framing, flushing, `[DONE]`
@@ -26,7 +26,36 @@ The consequence is that **shadow mode ships before substitution does**, and **op
 
 **Why first.** This is all the work that is tedious rather than interesting, and therefore underestimated: SSE edge cases, tool-call delta reassembly, cancellation, `bufio` buffer limits. Everything later depends on it, and none of it gets easier by waiting.
 
+**Why three adapters rather than two.** OpenAI's wire format *is* Relay's public format, so that adapter alone would have validated nothing — a pass-through would pass every test. Anthropic shares almost no structure with it (top-level system prompt, tool results inside user messages, a seven-event streaming state machine, usage split across both ends of the stream), and `internal/provider/providertest` asserts that all three produce byte-identical normalized results from their own recorded fixtures.
+
 **Done when:** an unmodified OpenAI SDK streams a tool-calling response through Relay from both providers, and cancelling the client visibly aborts the upstream call.
+
+**Verification status.** Everything above is covered by fixtures and `httptest` mock providers — including incremental frame delivery and cancellation propagation — and by a manual smoke run of the binary. The **live** half of "done when" is still open, because it needs a running Ollama or a real provider key. To close it:
+
+```sh
+# Local, free — needs Ollama installed
+ollama serve & ollama pull qwen2.5-coder
+go run ./cmd/relay -catalog config/catalog.yaml
+curl -N localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"ollama/qwen-coder@local","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+# Paid — one key, one provider
+export RELAY_CRED_ANTHROPIC_PRIMARY=sk-ant-...   # or RELAY_CRED_OPENAI_PRIMARY
+go run ./cmd/relay
+
+# The SDK check that actually closes the milestone
+pip install openai
+OPENAI_BASE_URL=http://localhost:8080/v1 OPENAI_API_KEY=unused python - <<'PY'
+from openai import OpenAI
+tools=[{"type":"function","function":{"name":"get_weather",
+  "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+for c in OpenAI().chat.completions.create(model="claude-sonnet-5", stream=True, tools=tools,
+        messages=[{"role":"user","content":"weather in Paris?"}]):
+    print(c.choices[0].delta)
+PY
+```
+
+Prices in `config/catalog.yaml` are illustrative and must be re-verified before any of this is pointed at real traffic; the loader rejects an attestation older than 90 days.
 
 ---
 

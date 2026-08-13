@@ -1,0 +1,196 @@
+# Relay model catalog.
+#
+# This file is data, not configuration-as-code: adding a model, repricing one,
+# or retiring one is reviewed like any other change and reloaded without a
+# deploy. The loader is strict — an unrecognised field is an error, not a
+# silently ignored line — because a typo here becomes a wrong routing decision
+# that nothing else in the system can detect.
+#
+# Prices are US dollars per million tokens, quoted the way providers publish
+# them. The values below are ILLUSTRATIVE and must be re-verified against each
+# provider's pricing page before this file is used against real traffic.
+
+version: "2026-08-04.1"
+
+endpoints:
+  - id: anthropic/claude-opus-5@us-east
+    provider: anthropic
+    model: claude-opus-5
+    deployment: us-east
+    credential_ref: anthropic-primary
+    capabilities:
+      streaming: true
+      tools: true
+      json_schema: true
+      vision: true
+      reasoning: true
+    limits:
+      context_window: 200000
+      max_output_tokens: 64000
+    pricing:
+      input: 15.00
+      cached_input: 1.50
+      output: 75.00
+      source: https://www.anthropic.com/pricing
+      verified_on: 2026-08-01
+    quality:
+      coding: 0.95
+      reasoning: 0.96
+      long_context: 0.92
+      vision: 0.88
+    lifecycle:
+      status: ga
+
+  - id: anthropic/claude-sonnet-5@us-east
+    provider: anthropic
+    model: claude-sonnet-5
+    deployment: us-east
+    credential_ref: anthropic-primary
+    capabilities:
+      streaming: true
+      tools: true
+      json_schema: true
+      vision: true
+      reasoning: true
+    limits:
+      context_window: 200000
+      max_output_tokens: 64000
+    pricing:
+      input: 3.00
+      cached_input: 0.30
+      output: 15.00
+      source: https://www.anthropic.com/pricing
+      verified_on: 2026-08-01
+    quality:
+      coding: 0.88
+      reasoning: 0.90
+      long_context: 0.85
+      vision: 0.80
+    lifecycle:
+      status: ga
+
+  - id: openai/gpt-4o-mini@us-east
+    provider: openai
+    model: gpt-4o-mini
+    deployment: us-east
+    credential_ref: openai-primary
+    capabilities:
+      streaming: true
+      tools: true
+      json_schema: true
+      vision: true
+    limits:
+      context_window: 128000
+      max_output_tokens: 16384
+    pricing:
+      input: 0.15
+      cached_input: 0.075
+      output: 0.60
+      source: https://openai.com/api/pricing/
+      verified_on: 2026-08-01
+    quality:
+      coding: 0.62
+      reasoning: 0.60
+      long_context: 0.65
+      vision: 0.60
+    lifecycle:
+      status: ga
+
+  - id: google/gemini-flash@us-central
+    provider: google
+    model: gemini-flash
+    deployment: us-central
+    credential_ref: google-primary
+    capabilities:
+      streaming: true
+      tools: true
+      json_schema: true
+      vision: true
+    limits:
+      context_window: 1000000
+      max_output_tokens: 8192
+    pricing:
+      input: 0.10
+      cached_input: 0.025
+      output: 0.40
+      source: https://ai.google.dev/pricing
+      verified_on: 2026-08-01
+    quality:
+      coding: 0.60
+      reasoning: 0.62
+      long_context: 0.88
+      vision: 0.70
+    lifecycle:
+      status: ga
+
+  # A local endpoint costs nothing, so it has no price to attest to and needs
+  # no verified_on. Everything priced above zero does.
+  - id: ollama/qwen-coder@local
+    provider: ollama
+    model: qwen2.5-coder
+    deployment: local
+    credential_ref: local
+    # Anything that is not the vendor's public host names it here: a local
+    # Ollama, an Azure deployment, a self-hosted vLLM. Adapters supply their
+    # own default when this is empty.
+    base_url: http://localhost:11434
+    capabilities:
+      streaming: true
+    limits:
+      context_window: 32768
+      max_output_tokens: 8192
+    pricing:
+      input: 0.00
+      output: 0.00
+    quality:
+      coding: 0.55
+      reasoning: 0.45
+    lifecycle:
+      status: ga
+
+# Aliases let callers keep sending the model names they already send. An alias
+# may not shadow an endpoint id — the loader rejects that, because Resolve
+# consults aliases first and the shadowed endpoint would become unreachable.
+aliases:
+  claude-opus-5: anthropic/claude-opus-5@us-east
+  claude-sonnet-5: anthropic/claude-sonnet-5@us-east
+  gpt-4o-mini: openai/gpt-4o-mini@us-east
+  gemini-flash: google/gemini-flash@us-central
+
+routes:
+  - name: relay/fast-coder
+    candidates:
+      - anthropic/claude-sonnet-5@us-east
+      - openai/gpt-4o-mini@us-east
+      - google/gemini-flash@us-central
+      - ollama/qwen-coder@local
+    # Savings are priced against this. The baseline is always evaluated as a
+    # candidate too, listed or not, so serving what the caller asked for is
+    # never an option the router removed from itself.
+    baseline: anthropic/claude-opus-5@us-east
+    require:
+      - capability: tools
+      - quality: coding
+        min: 0.60
+    weights:
+      quality.coding: 0.40
+      cost: 0.30
+      latency: 0.20
+      cache_affinity: 0.10
+    fallback: anthropic/claude-sonnet-5@us-east
+    max_attempts: 3
+
+  - name: relay/long-context
+    candidates:
+      - google/gemini-flash@us-central
+      - anthropic/claude-sonnet-5@us-east
+      - anthropic/claude-opus-5@us-east
+    baseline: anthropic/claude-opus-5@us-east
+    require:
+      - capability: tools
+    weights:
+      quality.long_context: 0.45
+      cost: 0.35
+      latency: 0.20
+    fallback: anthropic/claude-sonnet-5@us-east
+    max_attempts: 3

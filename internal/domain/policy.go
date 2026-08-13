@@ -33,6 +33,11 @@ type Policy struct {
 	// eliminated, never merely down-ranked — scores are relative to the
 	// surviving set, so a weight cannot express a floor. See ADR-0009.
 	QualityFloor map[string]float64
+
+	// Levers selects which request optimizations are enabled. The zero value
+	// enables none, so a tenant never discovers their requests are being
+	// rewritten because a field was left blank.
+	Levers LeverConfig
 }
 
 // DefaultPolicy is the safe policy: strict mode, no substitution, no limits.

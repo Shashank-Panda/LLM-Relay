@@ -59,6 +59,10 @@ endpoints:
     model: claude-sonnet-5
     deployment: us-east
     credential_ref: anthropic-primary
+    # Optional. Empty means the adapter's own default host. Set it for anything
+    # that is not the vendor's public endpoint: a local Ollama, an Azure OpenAI
+    # deployment, a self-hosted vLLM, a regional gateway.
+    base_url: null
 
     capabilities:
       streaming: true
@@ -74,6 +78,10 @@ endpoints:
       input: 3.00
       cached_input: 0.30
       output: 15.00
+      # Required for any endpoint priced above zero. The loader rejects a
+      # missing, malformed, future, or stale date.
+      source: https://www.anthropic.com/pricing
+      verified_on: 2026-08-01
     quality: # operator-supplied, 0..1, per dimension
       coding: 0.88
       reasoning: 0.90
@@ -112,7 +120,11 @@ routes:
     baseline: anthropic/claude-opus-5@us-east
     require:
       - capability: tools
-      - quality.coding: ">= 0.60" # hard floor; below this is eliminated, not down-ranked
+      # A hard floor: below this, candidates are eliminated, not down-ranked.
+      # Structured rather than an expression string — a constraint governing
+      # who may spend money is the last place to accept a stringly-typed DSL.
+      - quality: coding
+        min: 0.60
     weights:
       quality.coding: 0.40
       cost: 0.30

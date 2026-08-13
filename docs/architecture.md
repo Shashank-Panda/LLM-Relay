@@ -456,7 +456,7 @@ The consequence: estimates are for **admission control and routing** only — is
 
 **Tracing** (OpenTelemetry). One span per request, child spans for route, each attempt, and each provider call. Attempt spans carry endpoint, error class, and token counts, which makes a failover chain readable at a glance.
 
-**Logging** (Zap, structured, one line per request) with request ID, tenant, route, chosen endpoint, attempt count, tokens, cost, and outcome.
+**Logging** (`log/slog`, structured, one line per request) with request ID, tenant, route, chosen endpoint, attempt count, tokens, cost, and outcome. Stdlib rather than Zap: structured logging is no longer a reason to take a dependency, and the one Relay would be trading it for — a fraction of a microsecond per line, off the hot path — is not worth a dependency in a data plane whose whole argument is that it is small.
 
 **Prompt and response bodies are never logged by default.** They are the most sensitive data flowing through the system and logging them creates a compliance liability that is far easier to avoid than to unwind. Body capture is opt-in per tenant, subject to secret redaction, and carries a retention policy. `Policy.AllowPromptLogging` gates it.
 

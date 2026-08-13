@@ -10,7 +10,15 @@ The two things that make it a product rather than a proxy: **it never substitute
 
 ## Status
 
-**Pre-implementation.** This repository currently contains design documentation only. No code has been written yet.
+**Phase 1 built, phases 2–8 not started.** Relay serves `/v1/chat/completions` (streaming and non-streaming), `/v1/models`, `/healthz`, and `/readyz` against Ollama, OpenAI, and Anthropic. Routing, the catalog loader, and the request optimizer are implemented and tested but not yet reachable from the request path: **every request runs in `strict` mode and is served exactly as asked.** Nothing is substituted and no savings are recorded yet — that is [Phase 2](docs/roadmap.md).
+
+```sh
+go test ./...
+export RELAY_CRED_ANTHROPIC_PRIMARY=sk-ant-...    # or RELAY_CRED_OPENAI_PRIMARY
+go run ./cmd/relay -catalog config/catalog.yaml   # listens on :8080
+```
+
+Prices in `config/catalog.yaml` are illustrative. Re-verify them against each provider's pricing page before pointing this at real traffic — the loader refuses an attestation older than 90 days.
 
 The [roadmap](docs/roadmap.md) describes what gets built in what order; [`docs/adr/`](docs/adr/) records the decisions, including the ones still open.
 

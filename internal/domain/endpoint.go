@@ -54,6 +54,14 @@ type ModelEndpoint struct {
 	Deployment    string
 	CredentialRef string
 
+	// BaseURL overrides the adapter's default host.
+	//
+	// Required for anything that is not the vendor's public endpoint: a local
+	// Ollama, an Azure OpenAI deployment, a self-hosted vLLM, a regional
+	// gateway. Empty means the adapter's own default, so the common case stays
+	// out of the catalog.
+	BaseURL string
+
 	Capabilities Capabilities
 	Limits       Limits
 	Pricing      Pricing
