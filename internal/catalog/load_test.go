@@ -1,0 +1,472 @@
+package catalog
+
+import (
+	"errors"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Shashank-Panda/relay/internal/domain"
+	"github.com/Shashank-Panda/relay/internal/routing"
+)
+
+// asOf pins the clock so freshness tests assert behaviour rather than slowly
+// rotting as the calendar advances past the fixture's verified_on dates.
+var asOf = time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+
+func testOptions() Options {
+	return Options{MaxPriceAge: 90 * 24 * time.Hour, Now: asOf}
+}
+
+func load(t *testing.T, yaml string) (*domain.Catalog, error) {
+	t.Helper()
+	return Load(strings.NewReader(yaml), testOptions())
+}
+
+func mustLoad(t *testing.T, yaml string) *domain.Catalog {
+	t.Helper()
+	cat, err := load(t, yaml)
+	if err != nil {
+		t.Fatalf("Load: unexpected error: %v", err)
+	}
+	return cat
+}
+
+// minimal is the smallest catalog that loads, used as a base for mutation.
+const minimal = `
+version: "v1"
+endpoints:
+  - id: p/a@r
+    provider: p
+    model: a
+    deployment: r
+    credential_ref: c
+    capabilities: {streaming: true, tools: true}
+    limits: {context_window: 100000, max_output_tokens: 4096}
+    pricing: {input: 1.00, output: 2.00, verified_on: 2026-07-15}
+    quality: {coding: 0.8}
+routes:
+  - name: relay/r
+    candidates: [p/a@r]
+    baseline: p/a@r
+    weights: {cost: 1.0}
+`
+
+// TestLoadShippedCatalog keeps config/catalog.yaml honest. A shipped example
+// that no test loads is an example that silently stops being valid.
+func TestLoadShippedCatalog(t *testing.T) {
+	cat, err := LoadFile(filepath.Join("..", "..", "config", "catalog.yaml"), testOptions())
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+
+	if cat.Version != "2026-08-04.1" {
+		t.Errorf("version = %q", cat.Version)
+	}
+	if len(cat.Endpoints) != 5 {
+		t.Errorf("loaded %d endpoints, want 5", len(cat.Endpoints))
+	}
+	if len(cat.Routes) != 2 {
+		t.Errorf("loaded %d routes, want 2", len(cat.Routes))
+	}
+
+	t.Run("dollars become integer micro-dollars", func(t *testing.T) {
+		sonnet, ok := cat.Endpoint("anthropic/claude-sonnet-5@us-east")
+		if !ok {
+			t.Fatal("sonnet missing")
+		}
+		if got := sonnet.Pricing.Input; got != 3_000_000 {
+			t.Errorf("input rate = %d, want 3000000", got)
+		}
+		if got := sonnet.Pricing.Output; got != 15_000_000 {
+			t.Errorf("output rate = %d, want 15000000", got)
+		}
+		if got := sonnet.Pricing.CachedInput; got != 300_000 {
+			t.Errorf("cached input rate = %d, want 300000", got)
+		}
+	})
+
+	t.Run("prices that are not binary-representable round correctly", func(t *testing.T) {
+		// 0.15 * 1e6 is 150000.00000000003 in float64, and 0.075 * 1e6 is
+		// 74999.99999999999. Truncation would lose a micro-dollar on each.
+		mini, _ := cat.Endpoint("openai/gpt-4o-mini@us-east")
+		if got := mini.Pricing.Input; got != 150_000 {
+			t.Errorf("0.15/1M = %d, want 150000", got)
+		}
+		if got := mini.Pricing.CachedInput; got != 75_000 {
+			t.Errorf("0.075/1M = %d, want 75000", got)
+		}
+	})
+
+	t.Run("aliases resolve", func(t *testing.T) {
+		ep, ok := cat.Resolve("claude-sonnet-5")
+		if !ok || ep.ID != "anthropic/claude-sonnet-5@us-east" {
+			t.Errorf("Resolve(alias) = %v, %v", ep, ok)
+		}
+	})
+
+	t.Run("structured constraints convert", func(t *testing.T) {
+		rt, _ := cat.Route("relay/fast-coder")
+		want := []domain.Constraint{
+			{Capability: "tools"},
+			{QualityDim: "coding", QualityMin: 0.60},
+		}
+		if len(rt.Require) != len(want) {
+			t.Fatalf("require = %+v, want %+v", rt.Require, want)
+		}
+		for i := range want {
+			if rt.Require[i] != want[i] {
+				t.Errorf("require[%d] = %+v, want %+v", i, rt.Require[i], want[i])
+			}
+		}
+	})
+
+	t.Run("free endpoints need no price attestation", func(t *testing.T) {
+		qwen, ok := cat.Endpoint("ollama/qwen-coder@local")
+		if !ok {
+			t.Fatal("qwen missing")
+		}
+		if qwen.Pricing.Input != 0 || qwen.Pricing.Output != 0 {
+			t.Error("free endpoint has non-zero pricing")
+		}
+	})
+}
+
+// TestShippedCatalogRoutes wires the loader to the router, which is the only
+// way to know the file describes a catalog that can actually serve a request.
+func TestShippedCatalogRoutes(t *testing.T) {
+	cat, err := LoadFile(filepath.Join("..", "..", "config", "catalog.yaml"), testOptions())
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+
+	d, err := routing.Route(routing.Input{
+		Catalog: cat,
+		Policy:  &domain.Policy{Version: "t", OptimizationMode: domain.ModeOptimize},
+		Request: &domain.Request{
+			RouteName: "relay/fast-coder",
+			Baseline: domain.Baseline{
+				EndpointID: "anthropic/claude-opus-5@us-east",
+				Mode:       domain.ModeOptimize,
+			},
+			Need:     domain.Need{Tools: true},
+			Estimate: domain.Estimate{InputTokens: 8000, MaxOutputTokens: 1500, ExpectedOutputTokens: 1500},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+
+	if d.Chosen == "" {
+		t.Fatal("no endpoint chosen")
+	}
+	if !d.SavingMeasured {
+		t.Error("SavingMeasured = false; the route declares a baseline")
+	}
+	if d.BaselineCost != 232_500 {
+		t.Errorf("BaselineCost = %s, want $0.232500", d.BaselineCost)
+	}
+	// qwen-coder lacks tool support and must not survive the filter.
+	for _, c := range d.Ranked {
+		if c.EndpointID == "ollama/qwen-coder@local" {
+			t.Error("a tool-less endpoint was ranked for a tools request")
+		}
+	}
+}
+
+func TestStrictDecoding(t *testing.T) {
+	// The reason strict decoding exists: this typo would otherwise parse
+	// cleanly, leave Capabilities zero, and quietly remove the endpoint from
+	// every tools request without a single log line.
+	yaml := strings.Replace(minimal, "capabilities:", "capabilties:", 1)
+
+	_, err := load(t, yaml)
+	if err == nil {
+		t.Fatal("a misspelled field loaded successfully")
+	}
+	if !strings.Contains(err.Error(), "capabilties") {
+		t.Errorf("error does not name the offending field: %v", err)
+	}
+}
+
+func TestLoadReportsEveryProblemAtOnce(t *testing.T) {
+	yaml := `
+version: ""
+endpoints:
+  - id: p/a@r
+    provider: ""
+    model: ""
+    limits: {context_window: 0}
+    pricing: {input: 5.00}
+    quality: {coding: 1.7}
+`
+	_, err := load(t, yaml)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+
+	var le *LoadError
+	if !errors.As(err, &le) {
+		t.Fatalf("error is %T, want *LoadError", err)
+	}
+
+	// version, provider, model, context_window, quality range, verified_on.
+	if len(le.Problems) < 6 {
+		t.Errorf("reported %d problems, want at least 6 in one pass:\n%v", len(le.Problems), err)
+	}
+	for _, want := range []string{"version", "provider", "model", "context_window", "verified_on"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not mention %q:\n%v", want, err)
+		}
+	}
+}
+
+func TestPricingAttestation(t *testing.T) {
+	tests := []struct {
+		name    string
+		pricing string
+		opts    Options
+		wantErr string
+	}{
+		{
+			name:    "fresh price loads",
+			pricing: "{input: 1.00, output: 2.00, verified_on: 2026-07-15}",
+		},
+		{
+			name:    "free endpoint needs no attestation",
+			pricing: "{input: 0.00, output: 0.00}",
+		},
+		{
+			name:    "priced endpoint without attestation is rejected",
+			pricing: "{input: 1.00, output: 2.00}",
+			wantErr: "verified_on is required",
+		},
+		{
+			name:    "stale price is rejected",
+			pricing: "{input: 1.00, output: 2.00, verified_on: 2026-01-01}",
+			wantErr: "older than",
+		},
+		{
+			name:    "stale price passes when the check is disabled",
+			pricing: "{input: 1.00, output: 2.00, verified_on: 2020-01-01}",
+			opts:    Options{Now: asOf},
+		},
+		{
+			name:    "malformed date",
+			pricing: "{input: 1.00, output: 2.00, verified_on: 'last tuesday'}",
+			wantErr: "not a YYYY-MM-DD date",
+		},
+		{
+			// A future date is how a stale-price check gets defeated by
+			// accident: it silences the alarm without re-verifying anything.
+			name:    "future date is rejected",
+			pricing: "{input: 1.00, output: 2.00, verified_on: 2027-01-01}",
+			wantErr: "in the future",
+		},
+		{
+			name:    "negative price",
+			pricing: "{input: -1.00, output: 2.00, verified_on: 2026-07-15}",
+			wantErr: "negative",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			yaml := strings.Replace(minimal,
+				"pricing: {input: 1.00, output: 2.00, verified_on: 2026-07-15}",
+				"pricing: "+tc.pricing, 1)
+
+			opts := tc.opts
+			if opts == (Options{}) {
+				opts = testOptions()
+			}
+			_, err := Load(strings.NewReader(yaml), opts)
+
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected an error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestRejectsAmbiguityAndDuplication(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			// A duplicate would otherwise overwrite the first entry silently,
+			// taking its prices with it.
+			name: "duplicate endpoint id",
+			yaml: `
+version: "v1"
+endpoints:
+  - id: p/a@r
+    provider: p
+    model: a
+    limits: {context_window: 100000}
+    pricing: {input: 1.00, output: 2.00, verified_on: 2026-07-15}
+  - id: p/a@r
+    provider: p
+    model: a-again
+    limits: {context_window: 1000}
+    pricing: {input: 99.00, output: 99.00, verified_on: 2026-07-15}
+`,
+			wantErr: "duplicate endpoint id",
+		},
+		{
+			name:    "alias shadowing an endpoint id",
+			yaml:    minimal + "aliases: {p/a@r: p/a@r}\n",
+			wantErr: "shadows the endpoint",
+		},
+		{
+			name:    "alias pointing nowhere",
+			yaml:    minimal + "aliases: {ghost: p/missing@r}\n",
+			wantErr: "unknown endpoint",
+		},
+		{
+			name: "duplicate candidate in a route",
+			yaml: strings.Replace(minimal,
+				"candidates: [p/a@r]", "candidates: [p/a@r, p/a@r]", 1),
+			wantErr: "listed more than once",
+		},
+		{
+			name: "unknown candidate",
+			yaml: strings.Replace(minimal,
+				"candidates: [p/a@r]", "candidates: [p/missing@r]", 1),
+			wantErr: "unknown candidate",
+		},
+		{
+			name: "weights that do not sum to one",
+			yaml: strings.Replace(minimal,
+				"weights: {cost: 1.0}", "weights: {cost: 0.5, latency: 0.9}", 1),
+			wantErr: "must sum to 1",
+		},
+		{
+			name: "unknown scoring dimension",
+			yaml: strings.Replace(minimal,
+				"weights: {cost: 1.0}", "weights: {vibes: 1.0}", 1),
+			wantErr: "unknown scoring dimension",
+		},
+		{
+			name: "unknown capability in a constraint",
+			yaml: strings.Replace(minimal,
+				"weights: {cost: 1.0}",
+				"weights: {cost: 1.0}\n    require:\n      - capability: telepathy", 1),
+			wantErr: "capability \"telepathy\" is not one of",
+		},
+		{
+			name: "constraint with neither capability nor quality",
+			yaml: strings.Replace(minimal,
+				"weights: {cost: 1.0}",
+				"weights: {cost: 1.0}\n    require:\n      - min: 0.5", 1),
+			wantErr: "requires either capability or quality",
+		},
+		{
+			name: "quality constraint out of range",
+			yaml: strings.Replace(minimal,
+				"weights: {cost: 1.0}",
+				"weights: {cost: 1.0}\n    require:\n      - quality: coding\n        min: 1.5", 1),
+			wantErr: "must be between 0 and 1",
+		},
+		{
+			name: "invalid lifecycle status",
+			yaml: `
+version: "v1"
+endpoints:
+  - id: p/a@r
+    provider: p
+    model: a
+    limits: {context_window: 100000}
+    pricing: {input: 1.00, output: 2.00, verified_on: 2026-07-15}
+    lifecycle: {status: mostly-fine}
+`,
+			wantErr: "is not one of ga, preview",
+		},
+		{
+			name:    "empty file",
+			yaml:    "",
+			wantErr: "file is empty",
+		},
+		{
+			name:    "no endpoints",
+			yaml:    "version: \"v1\"\n",
+			wantErr: "at least one endpoint",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := load(t, tc.yaml)
+			if err == nil {
+				t.Fatalf("expected an error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v,\nwant it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestDefaults(t *testing.T) {
+	cat := mustLoad(t, minimal)
+
+	ep, _ := cat.Endpoint("p/a@r")
+	if ep.Lifecycle.Status != domain.StatusGA {
+		t.Errorf("lifecycle.status = %q, want ga by default", ep.Lifecycle.Status)
+	}
+
+	rt, _ := cat.Route("relay/r")
+	if rt.MaxAttempts != 1 {
+		t.Errorf("max_attempts = %d, want 1 by default", rt.MaxAttempts)
+	}
+}
+
+func TestLoadedMapsAreNotSharedWithTheDecoder(t *testing.T) {
+	// The catalog is handed to the router as an immutable snapshot. Mutating a
+	// returned map must not reach back into anything the loader still holds.
+	cat := mustLoad(t, minimal)
+	ep, _ := cat.Endpoint("p/a@r")
+	ep.Quality["coding"] = 0.1
+
+	again := mustLoad(t, minimal)
+	epAgain, _ := again.Endpoint("p/a@r")
+	if epAgain.Quality["coding"] != 0.8 {
+		t.Errorf("quality leaked across loads: %v", epAgain.Quality["coding"])
+	}
+}
+
+func TestLoadFileErrors(t *testing.T) {
+	if _, err := LoadFile(filepath.Join("testdata", "does-not-exist.yaml"), testOptions()); err == nil {
+		t.Error("loading a missing file succeeded")
+	}
+}
+
+func TestLoadErrorFormatting(t *testing.T) {
+	single := &LoadError{Problems: []Problem{{Path: "version", Msg: "is required"}}}
+	if got := single.Error(); got != "catalog: version: is required" {
+		t.Errorf("single-problem error = %q", got)
+	}
+
+	multi := &LoadError{Problems: []Problem{
+		{Path: "version", Msg: "is required"},
+		{Path: "endpoints[0]", Msg: "id is required"},
+	}}
+	got := multi.Error()
+	if !strings.Contains(got, "2 problems") ||
+		!strings.Contains(got, "version") ||
+		!strings.Contains(got, "endpoints[0]") {
+		t.Errorf("multi-problem error = %q", got)
+	}
+}

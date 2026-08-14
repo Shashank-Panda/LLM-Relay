@@ -1,0 +1,58 @@
+# Relay tenant registry.
+#
+# This file exists so the savings ledger has a tenant dimension. It is a thin
+# slice of what Phase 7 will build — Postgres-backed tenants, key rotation,
+# scopes, an admin API — and deliberately not more than that.
+#
+# Keys are stored as SHA-256 hex digests, never plaintext, so that a leaked copy
+# of this file is not a set of working credentials. The loader rejects anything
+# that is not a digest, because a plaintext key pasted here would simply never
+# match and the operator would debug an authentication failure that looks like a
+# client problem.
+#
+#   Generate a key and its digest:
+#     KEY="sk-relay-$(openssl rand -hex 16)"
+#     echo "$KEY"                     # give this to the customer, once
+#     printf '%s' "$KEY" | sha256sum  # put this here
+#
+# If this file is absent, every request is anonymous and attributed to the
+# default tenant. That is Phase 1's behaviour and it still works.
+
+# The tenant an unkeyed request belongs to. Strict, because nobody should be
+# opted into substitution by not presenting a key.
+default:
+  id: default
+  name: anonymous
+  policy:
+    optimization_mode: strict
+
+tenants:
+  # A customer evaluating Relay. Shadow mode serves exactly what they ask for
+  # and records what a cheaper route would have cost, so they can read a month
+  # of savings before granting permission to substitute anything.
+  #
+  # Key: sk-relay-demo-shadow-0123456789ab   (demo only — rotate before real use)
+  - id: acme
+    name: Acme Corp
+    keys:
+      - 9325a9957aa26895e4ecf80be2e9146d34547baef22dfa97e9dc39eae20ad6ae
+    policy:
+      optimization_mode: shadow
+      # A hard ceiling per request, independent of the mode. Eliminates
+      # candidates during filtering rather than failing after the spend.
+      max_cost_per_request_usd: 2.00
+      # A floor, not a weight: scores are relative to whichever candidates
+      # survive, so a weight cannot express "never below this". See ADR-0009.
+      quality_floor:
+        coding: 0.60
+
+  # A customer who has not opted into anything. Everything is served exactly as
+  # requested and the ledger still records what it cost.
+  #
+  # Key: sk-relay-demo-strict-fedcba98765
+  - id: globex
+    name: Globex
+    keys:
+      - 253c95211cd4ba54e4c7062e4d6fd5f23068c828cef4269dfdbc413d9b079539
+    policy:
+      optimization_mode: strict

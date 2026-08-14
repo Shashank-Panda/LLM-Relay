@@ -1,658 +1,188 @@
 # Relay
 
-> **An AI Gateway & Control Plane for Intelligent Multi-LLM Routing**
+> **Cut your LLM bill without changing your code.** Point your OpenAI SDK at Relay, keep calling the models you already call, and Relay serves each request from the cheapest option that still meets your quality bar — then shows you exactly what it saved.
+
+Relay is an AI gateway that sits between your applications and your model providers. Applications talk to it with the OpenAI SDK they already have, sending the model names they already send. Relay normalizes the request, optimizes it, routes it to the cheapest endpoint that clears the quality floor, and streams the answer back unchanged in shape.
+
+The two things that make it a product rather than a proxy: **it never substitutes silently** — every swap is disclosed in response headers with the saving attached — and **it measures the counterfactual**, so "we cut your spend 38%" is a number you can audit rather than a claim you have to believe.
 
 ---
 
-# Vision
+## Status
 
-Relay is an AI Gateway that abstracts multiple LLM providers behind a single, provider-agnostic API.
+**Phases 1–2 built, phases 3–8 not started.** Relay serves `/v1/chat/completions` (streaming and non-streaming), `/v1/models`, `/healthz`, and `/readyz` against Ollama, OpenAI, and Anthropic, and records a per-request savings ledger.
 
-Rather than simply forwarding requests to different providers, Relay acts as an intelligent decision engine that determines the optimal model based on factors such as:
+`strict` and `shadow` modes work, per tenant. **Nothing is ever substituted yet** — `optimize` mode is [Phase 5](docs/roadmap.md). Shadow mode serves exactly what was asked and records what a cheaper route *would* have cost on the same tokens, which is the whole point: a customer can measure a month of savings before granting permission to change anything.
 
-* Prompt characteristics
-* Provider capabilities
-* Cost
-* Latency
-* Context window
-* Reliability
-* Organization policies
-* Historical performance
+```sh
+go test ./...
+export RELAY_CRED_ANTHROPIC_PRIMARY=sk-ant-...    # or RELAY_CRED_OPENAI_PRIMARY
+go run ./cmd/relay                                # data plane :8080, admin 127.0.0.1:9090
 
-The long-term objective is to build infrastructure that could realistically be deployed inside an organization as the central platform for AI consumption.
-
----
-
-# Project Goals
-
-## Functional Goals
-
-* Unified API for multiple LLM providers
-* Intelligent prompt classification
-* Dynamic provider routing
-* Explainable routing decisions
-* Provider failover
-* Streaming support
-* Cost optimization
-* Observability
-* Enterprise-ready architecture
-
-## Non-Functional Goals
-
-* Extensible
-* Highly testable
-* Idiomatic Go
-* Provider agnostic
-* Easily configurable
-* Production-oriented
-* OpenAI-compatible API
-* Clean architecture
-* Low coupling
-* High cohesion
-
----
-
-# High-Level Architecture
-
-```
-                  Clients
-
-    CLI
-    VS Code
-    Slack
-    REST API
-    Future SDKs
-
-                │
-                ▼
-
-        API Gateway Layer
-
-                │
-
-                ▼
-
-      Request Validation
-
-                │
-
-                ▼
-
-      Prompt Classification
-
-                │
-
-                ▼
-
-       Prompt Analysis
-
-                │
-
-                ▼
-
-        Routing Engine
-
-                │
-
-                ▼
-
-     Policy Enforcement
-
-                │
-
-                ▼
-
-    Provider Selection
-
-                │
-
-                ▼
-
- Provider Abstraction Layer
-
-      ┌──────────────┐
-      │ OpenAI       │
-      │ Anthropic    │
-      │ Gemini       │
-      │ Ollama       │
-      │ Future       │
-      └──────────────┘
-
-                │
-
-                ▼
-
-      Streaming Response
-
-                │
-
-                ▼
-
-     Response Normalization
-
-                │
-
-                ▼
-
-              Client
+curl -s localhost:9090/savings?tenant=acme        # the savings report
+curl -s localhost:9090/metrics                    # Prometheus
 ```
 
----
+**`saved` and `shadow_saved` are different numbers and are never summed.** In shadow mode the baseline is served, so nothing is actually saved; `shadow_saved` is what optimization *would* have saved. That separation runs from the ledger through the metrics to the report, because reporting the second as the first would tell a customer they had banked money they had not.
 
-# Core Components
+Prices in `config/catalog.yaml` are illustrative. Re-verify them against each provider's pricing page before pointing this at real traffic — the loader refuses an attestation older than 90 days. Tenant API keys live in `config/tenants.yaml` as SHA-256 digests; a missing file means every request is anonymous, which is what Phase 1 did.
 
-## 1. API Gateway
-
-Responsibilities
-
-* Accept requests
-* Validate requests
-* Authentication
-* Streaming
-* Response normalization
-* Error handling
+The [roadmap](docs/roadmap.md) describes what gets built in what order; [`docs/adr/`](docs/adr/) records the decisions, including the ones still open.
 
 ---
 
-## 2. Provider Abstraction Layer
+## The problem
 
-Every provider should implement a common interface.
+A team standardizes on a strong model because it was the safe choice during development. Then production traffic arrives, and most of it turns out to be easy — short classifications, formatting, extraction, routine tool calls — all being served by a frontier model at frontier prices. Meanwhile the reasoning budget is set high globally because nobody wanted to tune it per call site, prompt caching is left on the table because inserting breakpoints correctly is fiddly, and `max_tokens` is set to whatever the example used.
 
-Example:
+Every one of those is a real, recoverable cost. None of them get fixed, because fixing them means auditing hundreds of call sites, and nobody can prove in advance that the cheaper option is good enough.
 
-* Chat
-* Streaming Chat
-* Embeddings
-* Images (future)
-* Audio (future)
-
-Goals
-
-* Plug-and-play providers
-* Easy provider onboarding
-* No provider-specific logic outside adapters
+Relay makes those decisions per request, at the gateway, with the evidence attached.
 
 ---
 
-## 3. Prompt Classification Engine
+## Where the savings come from
 
-Classify every prompt before routing.
+Model substitution is only part of it. Relay pulls four levers:
 
-Possible outputs:
+| Lever | What it does | Typical saving |
+|---|---|---|
+| **Model downgrade** | Serve an easy request from a cheaper endpoint that clears the quality floor | Large, highly traffic-dependent |
+| **Prompt-cache activation** | Insert cache breakpoints automatically, and keep sessions on the endpoint holding the warm cache | Up to ~90% of repeated input cost |
+| **Effort and ceiling tuning** | Downshift reasoning/thinking budgets and cap `max_tokens` to observed p95 | Large on reasoning models |
+| **Response cache** | Return the stored answer for an identical request | 100% on hits |
 
-* Task Type
-* Programming Language
-* Framework
-* Domain
-* Reasoning Complexity
-* Vision Requirement
-* Context Window Requirement
-* Estimated Tokens
-* Confidence Score
-* Streaming Recommendation
-
-Example task categories:
-
-* Code Generation
-* Code Review
-* Debugging
-* Refactoring
-* Architecture
-* Summarization
-* Translation
-* Research
-* Creative Writing
-* SQL
-* Data Analysis
-* Legal
-* Medical
-* OCR
-
-The classifier should evolve over time:
-
-V1
-
-* Rule-based
-
-V2
-
-* Rule + heuristics
-
-V3
-
-* Lightweight AI classifier
-
-V4
-
-* Self-improving classifier
+The second one is worth calling out because it is the least visible and often the largest: providers charge a fraction of the normal input price to read a cached prompt prefix, but only if breakpoints are placed correctly and the conversation keeps hitting the same endpoint. Relay does both. A naive cost-optimizing router that ignores cache affinity will migrate a conversation to a "cheaper" model and increase the bill.
 
 ---
 
-# Prompt Analysis
+## How adoption works
 
-Estimate
+```diff
+- base_url = "https://api.openai.com/v1"
++ base_url = "https://relay.example.com/v1"
+```
 
-* Cost
-* Latency
-* Token usage
-* Temperature recommendation
-* Max token recommendation
-* Context length
-* Complexity
+That is the whole integration. Keep sending `model: "gpt-4o"`.
 
----
+Relay treats the model you asked for as a **baseline and a ceiling**: it will not serve you something above it, and it will serve you something below it only when the request clears your quality floor. Every response tells you what actually happened:
 
-# Routing Engine
+```http
+X-Relay-Served:     openai/gpt-4o-mini@us-east
+X-Relay-Baseline:   openai/gpt-4o@us-east
+X-Relay-Cost-Usd:   0.000210
+X-Relay-Baseline-Usd: 0.003480
+X-Relay-Saved-Usd:  0.003270
+```
 
-The routing engine is the core of Relay.
+Three ways to stay in control:
 
-It should never contain provider-specific logic.
+- **`X-Relay-Pin: strict`** on any request — served exactly as asked, no optimization. Always honored.
+- **Shadow mode** — Relay serves exactly what you asked for and only *reports* what it would have saved. Run it for a week before enabling anything.
+- **Quality floor** — a hard constraint, not a preference. Endpoints below it are eliminated, never merely ranked lower.
 
-Instead it receives structured metadata from the classifier.
-
-Example inputs:
-
-* Task type
-* Complexity
-* Estimated tokens
-* Required capabilities
-* User preferences
-* Organization policies
-
-The routing engine should score every provider.
-
-Possible scoring factors:
-
-Provider Quality
-
-* Coding quality
-* Reasoning quality
-* Vision quality
-* Long context capability
-* Tool calling support
-
-Performance
-
-* Live latency
-* Historical latency
-* Success rate
-* Failure rate
-
-Cost
-
-* Input token cost
-* Output token cost
-* Estimated request cost
-
-Context
-
-* Maximum context window
-* Streaming support
-
-Policies
-
-* Organization restrictions
-* Provider allow/block lists
-
-Preferences
-
-* User preference
-* Team preference
-
-The routing engine should return:
-
-* Selected provider
-* Final score
-* Provider rankings
-* Routing explanation
+See [ADR-0007](docs/adr/0007-requested-model-as-baseline.md) for why substitution is opt-in and always disclosed.
 
 ---
 
-# Explainable Routing
+## Architecture at a glance
 
-Every routing decision should be transparent.
+Relay separates a stateless **data plane** on the hot path from a **control plane** holding configuration and accounting.
 
-Example:
+```
+                         ┌──────────────────────────────────┐
+   OpenAI-compatible     │           DATA PLANE             │
+   clients ─────────────▶│                                  │
+   (any SDK, any lang)   │  auth ▸ limits ▸ validate ▸       │
+                         │  normalize                       │
+                         │            │                     │
+                         │            ▼                     │
+                         │  ┌──────────────────┐            │
+                         │  │ Optimizer        │            │
+                         │  │ cache breakpoints│            │
+                         │  │ effort / ceilings│            │
+                         │  └────────┬─────────┘            │
+                         │           ▼                      │
+                         │  ┌──────────────────┐            │
+                         │  │ Router  (pure)   │◀── catalog │
+                         │  │ filter▸score▸rank│◀── policy  │
+                         │  └────────┬─────────┘◀── health  │
+                         │           │ Decision + Baseline  │
+                         │           ▼                      │
+                         │  ┌──────────────────┐            │
+                         │  │ Executor         │            │
+                         │  │ retry / failover │            │
+                         │  │ cascade escalate │            │
+                         │  └────────┬─────────┘            │
+                         │           ▼                      │
+                         │  ┌──────────────────┐            │
+                         │  │ Provider adapters│            │
+                         │  │ OpenAI Anthropic │            │
+                         │  │ Gemini  Ollama   │            │
+                         │  └────────┬─────────┘            │
+                         │           │                      │
+                         │   normalize ▸ stream ▸ meter     │
+                         └───────────┬──────────────────────┘
+                                     │ usage + savings + decisions
+                         ┌───────────▼──────────────────────┐
+                         │          CONTROL PLANE           │
+                         │  tenants · API keys · budgets    │
+                         │  model catalog · routing policy  │
+                         │  savings ledger · audit          │
+                         │  admin API · analytics           │
+                         └──────────────────────────────────┘
+```
 
-Selected Provider
+Three properties matter more than the boxes:
 
-Reason:
+**Routing is a pure function.** `Router.Route(request, catalog, policy, health) → Decision` performs no I/O. It is a deterministic transformation of inputs into a ranked list with reasons attached, which makes it exhaustively testable and makes the explainability API free — the `Decision` *is* the explanation.
 
-* Coding Quality
-* Cost
-* Latency
-* Context
-* Policy
+**Execution is separate from routing.** The `Executor` takes a `Decision` and carries it out: retries, failover, cascade escalation, streaming. Routing never knows about HTTP; execution never re-derives preferences.
 
-Provider Rankings
+**Every request records both costs.** What it cost, and what the baseline would have cost. That difference is the product.
 
-* Claude
-* GPT
-* Gemini
-
-Scoring breakdown
-
-This should be accessible via an API for debugging.
-
----
-
-# Reliability
-
-Features
-
-* Retry mechanism
-* Exponential backoff
-* Circuit breaker
-* Health checks
-* Automatic provider failover
-* Request timeouts
-* Provider isolation
-* Recovery after health restoration
-
----
-
-# Streaming
-
-Support token streaming.
-
-Requirements
-
-* Provider-independent streaming
-* Response normalization
-* Graceful cancellation
-* Backpressure handling
-* Streaming metrics
-
----
-
-# Provider Management
-
-Support
-
-* Dynamic provider registration
-* Provider enable/disable
-* Model mapping
-* Default provider
-* Provider priority
-* Provider capability registry
+Full detail in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
-# Caching
+## Deployment
 
-Possible cache layers
+**Hosted SaaS** is the default: point at Relay's endpoint, bring your own provider keys. Relay never fronts your provider spend and never retains prompt content.
 
-* Prompt hash cache
-* Response cache
-* Redis cache
-* Semantic cache (future)
+**Self-hosted** for regulated or high-sensitivity environments: run the same binary in your own VPC, prompts never leave your network. Same control plane, same admin API.
 
-Metrics
-
-* Cache hits
-* Cache misses
-* Hit ratio
+Relay is a hard dependency in your critical path, so it is built to **fail open**: if Relay is degraded, requests pass through to the baseline model unrouted rather than failing. Being unable to optimize must never mean being unable to serve.
 
 ---
 
-# Observability
+## Documentation
 
-Metrics
-
-* Request count
-* Token usage
-* Cost
-* Latency
-* TTFT
-* Streaming duration
-* Provider usage
-* Provider failures
-* Retry count
-* Cache metrics
-
-Logging
-
-* Request logs
-* Provider logs
-* Routing logs
-* Error logs
-
-Tracing
-
-* Request lifecycle
-* Provider calls
-* Routing decisions
-
-Integrations
-
-* Prometheus
-* Grafana
-* OpenTelemetry
+| Document | Contents |
+|---|---|
+| [`docs/architecture.md`](docs/architecture.md) | Components, core types, optimizer, streaming, reliability, state, SLOs |
+| [`docs/routing.md`](docs/routing.md) | Baseline semantics, quality floor, scoring, catalog, savings accounting |
+| [`docs/roadmap.md`](docs/roadmap.md) | Build order, and what is explicitly out of scope |
+| [`docs/adr/`](docs/adr/) | Architecture decision records, including open decisions |
 
 ---
 
-# Learning & Analytics
+## Stack
 
-Store historical routing information.
-
-Metrics
-
-* Provider success rate
-* Provider latency
-* Provider cost
-* Provider usage
-* User feedback
-
-Future goal
-
-Allow routing to improve using historical data instead of static rules.
+Go · Chi · Viper · Zap · Postgres · Redis · Prometheus · OpenTelemetry · Docker
 
 ---
 
-# Multi-Provider Strategies
+## Design principles
 
-Future support
-
-* Parallel execution
-* Fastest response wins
-* Consensus routing
-* Majority voting
-* Best-answer selection
-* Response merging
+- **Never substitute silently.** Every swap is disclosed, every saving is attributable, `strict` is always honored.
+- **Quality is a floor, not a preference.** Cost optimization that degrades output is not a saving.
+- **Prove the saving.** A cost-reduction product that cannot measure the counterfactual is asking for trust it hasn't earned.
+- **Provider logic lives only in adapters.** Nothing above the adapter layer branches on vendor name.
+- **Decisions are data.** Routing produces a struct, not a side effect.
+- **Fail open.** Degraded optimization beats a failed request.
 
 ---
 
-# Enterprise Features
+## License
 
-Authentication
-
-* API Keys
-* JWT
-* OAuth
-
-Authorization
-
-* RBAC
-
-Organization Support
-
-* Teams
-* Organizations
-* User quotas
-
-Budgets
-
-* Daily budget
-* Monthly budget
-
-Policies
-
-* Provider restrictions
-* PII rules
-* Cost policies
-
-Audit Logs
-
-Track
-
-* User
-* Time
-* Provider
-* Tokens
-* Cost
-
----
-
-# Security
-
-* Prompt sanitization
-* Secret detection
-* Secret masking
-* PII detection
-* Request validation
-* Input limits
-* Output filtering
-
----
-
-# Configuration
-
-Configuration should support
-
-* YAML
-* Environment variables
-* Runtime reload
-* Routing policies
-* Provider configuration
-* Feature flags
-
----
-
-# Developer Experience
-
-* Docker
-* Docker Compose
-* GitHub Actions
-* Swagger/OpenAPI
-* Postman Collection
-* Unit Tests
-* Integration Tests
-* Mock Providers
-
----
-
-# Deployment
-
-Initial
-
-* Local Docker
-
-Later
-
-* Cloud Run
-* Fly.io
-* Render
-
-Eventually
-
-* Kubernetes
-
----
-
-# Technology Stack
-
-Language
-
-* Go
-
-HTTP
-
-* Chi
-
-Configuration
-
-* Viper
-
-Logging
-
-* Zap
-
-Caching
-
-* Redis
-
-Metrics
-
-* Prometheus
-
-Tracing
-
-* OpenTelemetry
-
-Documentation
-
-* Swagger/OpenAPI
-
-Testing
-
-* Go Testing
-* Table-driven tests
-
-Containerization
-
-* Docker
-
-CI/CD
-
-* GitHub Actions
-
----
-
-# Design Principles
-
-* Clean Architecture
-* SOLID Principles
-* Dependency Inversion
-* Interface-driven design
-* Composition over inheritance
-* Provider independence
-* Configuration over hardcoding
-* High cohesion
-* Low coupling
-
----
-
-# Explicit Non-Goals (Initial Versions)
-
-The following are intentionally out of scope for early iterations:
-
-* RAG
-* Vector databases
-* Agent frameworks
-* Workflow automation
-* Fine-tuning models
-* Custom LLM training
-* Frontend dashboard (until backend is mature)
-
----
-
-# Questions for Architecture Review
-
-Please review this architecture critically as if you were a Principal Engineer or Staff Engineer responsible for approving it for production.
-
-Specifically evaluate:
-
-1. Overall architecture and separation of concerns.
-2. Extensibility for adding new providers and routing strategies.
-3. Scalability under high request volume.
-4. Concurrency model and potential bottlenecks.
-5. Streaming architecture.
-6. Reliability and fault tolerance.
-7. Testability of each component.
-8. Configuration management.
-9. Any unnecessary complexity or over-engineering.
-10. Missing components required for a production-grade AI Gateway.
-11. Alternative architectural approaches and their trade-offs.
-12. Recommended implementation order to maximize learning while minimizing rework.
-
-Provide brutally honest feedback and suggest improvements before any implementation begins.
+Not yet chosen.
