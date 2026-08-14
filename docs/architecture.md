@@ -408,6 +408,8 @@ Stop accepting new requests, drain in-flight non-streaming requests, allow in-fl
 | State | Lives in | Why |
 |---|---|---|
 | Tenants, API keys, budgets, audit log, usage records, decision history | **Postgres** | Durable, queryable, transactional. This is the system of record. |
+
+> **As built (Phase 2).** Postgres does not exist yet. The savings ledger writes to an append-only JSONL file plus an in-memory aggregate, which is the *spill path* this table's own fail-open row already requires — so Phase 7 adds a Postgres sink behind the same `meter.Sink` interface rather than replacing anything. Tenants and hashed API keys live in a YAML file read at startup. Two consequences worth stating: the in-memory aggregate is per-process, so behind N replicas `/savings` reports one instance's view (the JSONL file is what makes the global figure reconstructable meanwhile), and it resets on restart.
 | Model catalog, routes, policies | **Postgres**, snapshotted to memory | Edited via admin API, versioned, read on the hot path from an in-memory snapshot |
 | Response cache, rate-limit counters, budget reservations | **Redis** | Shared across instances, tolerant of loss |
 | Latency EWMA, circuit-breaker state, in-flight counts | **Per-process**, optionally mirrored to Redis | Hot-path reads must not cross the network |

@@ -104,9 +104,17 @@ func Route(in Input) (*domain.Decision, error) {
 
 	// Shadow mode routes the counterfactual but serves the baseline: the tenant
 	// measures the saving without yet accepting any behaviour change.
+	//
+	// Note what is deliberately *not* called here. serveBaseline replaces Ranked
+	// with a single synthetic entry, which is right for strict mode and for a
+	// fallback — no scoring happened, so reporting a ranking would imply a
+	// comparison that was never made. In shadow mode the comparison is the
+	// entire product: the ranking is the evidence for the counterfactual, and
+	// discarding it would leave a savings report nobody could drill into.
 	if mode == domain.ModeShadow && hasBaseline {
 		d.Counterfactual = best.EndpointID
-		serveBaseline(d, baseline, baselineCost, "shadow mode: counterfactual recorded, baseline served")
+		d.CounterfactualCost = best.Cost
+		setServed(d, baseline.ID, baselineCost)
 		return d, nil
 	}
 

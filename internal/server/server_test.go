@@ -70,6 +70,10 @@ type harness struct {
 	relay    *httptest.Server
 	upstream *httptest.Server
 
+	// server is the Relay instance behind relay, exposed so a test can drive
+	// shutdown directly.
+	server *server.Server
+
 	// lastUpstream is the body the provider actually received.
 	lastUpstream map[string]any
 }
@@ -111,11 +115,11 @@ func newHarness(t *testing.T, handler http.HandlerFunc) *harness {
 		Policy:   domain.DefaultPolicy(),
 	}
 
-	srv := server.New(gw, store, registry, server.Options{
+	h.server = server.New(gw, store, registry, server.Options{
 		Logger: slog.New(slog.DiscardHandler),
 	})
 
-	h.relay = httptest.NewServer(srv.Handler())
+	h.relay = httptest.NewServer(h.server.Handler())
 	t.Cleanup(func() {
 		h.relay.Close()
 		client.CloseIdleConnections()

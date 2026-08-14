@@ -13,7 +13,7 @@ import (
 
 type ctxKey int
 
-const ctxRequestID ctxKey = iota
+const ctxRequestID ctxKey = 0
 
 // HeaderRequestID lets a caller supply their own correlation ID so their traces
 // and Relay's line up. Relay generates one when they do not.

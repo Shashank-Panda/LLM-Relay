@@ -13,20 +13,29 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+
 	"github.com/Shashank-Panda/relay/internal/catalog"
 	"github.com/Shashank-Panda/relay/internal/domain"
 	"github.com/Shashank-Panda/relay/internal/execute"
 	"github.com/Shashank-Panda/relay/internal/gateway"
+	"github.com/Shashank-Panda/relay/internal/meter"
+	"github.com/Shashank-Panda/relay/internal/metrics"
 	"github.com/Shashank-Panda/relay/internal/provider"
 	"github.com/Shashank-Panda/relay/internal/provider/anthropic"
 	"github.com/Shashank-Panda/relay/internal/provider/ollama"
 	"github.com/Shashank-Panda/relay/internal/provider/openai"
 	"github.com/Shashank-Panda/relay/internal/server"
+	"github.com/Shashank-Panda/relay/internal/tenant"
 )
 
 type config struct {
 	addr         string
+	adminAddr    string
 	catalogPath  string
+	tenantsPath  string
+	ledgerPath   string
 	maxPriceAge  time.Duration
 	logLevel     string
 	logFormat    string
@@ -42,8 +51,17 @@ func main() {
 
 func run() error {
 	var cfg config
-	flag.StringVar(&cfg.addr, "addr", ":8080", "listen address")
+	flag.StringVar(&cfg.addr, "addr", ":8080", "listen address for the data plane")
+	// Loopback by default. The savings query exposes every tenant's spend and
+	// there is no authentication on it until Phase 7, so the bind address is
+	// the control.
+	flag.StringVar(&cfg.adminAddr, "admin-addr", "127.0.0.1:9090",
+		"listen address for /metrics and /savings; empty disables it")
 	flag.StringVar(&cfg.catalogPath, "catalog", "config/catalog.yaml", "path to the model catalog")
+	flag.StringVar(&cfg.tenantsPath, "tenants", "config/tenants.yaml",
+		"path to the tenant registry; a missing file means every request is anonymous")
+	flag.StringVar(&cfg.ledgerPath, "ledger", "data/ledger.jsonl",
+		"append-only savings ledger; empty disables durable metering")
 	flag.DurationVar(&cfg.maxPriceAge, "max-price-age", 90*24*time.Hour,
 		"reject pricing not verified within this window; 0 disables the check")
 	flag.StringVar(&cfg.logLevel, "log-level", "info", "debug | info | warn | error")
@@ -83,15 +101,45 @@ func run() error {
 			"endpoints", unreachable)
 	}
 
+	tenants, err := tenant.LoadFile(cfg.tenantsPath)
+	if err != nil {
+		return err
+	}
+
+	// Metrics and the ledger are fed from the same Record, so a dashboard and a
+	// savings report cannot disagree about the product's headline number.
+	promReg := prometheus.NewRegistry()
+	promReg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	mx := metrics.New(promReg)
+
+	agg := meter.NewAggregator(time.Now().UTC())
+	sinks := []meter.Sink{agg, mx}
+
+	if cfg.ledgerPath != "" {
+		ledger, err := meter.OpenFile(cfg.ledgerPath, 64)
+		if err != nil {
+			return err
+		}
+		defer ledger.Close()
+		sinks = append(sinks, ledger)
+	}
+	mtr := meter.New(meter.DefaultBuffer, sinks...)
+
 	gw := &gateway.Gateway{
 		Store:    store,
 		Executor: execute.New(registry, resolver),
-		// Phase 1 is strict for everybody: serve exactly what was asked, never
-		// substitute. Phase 7 makes this per-tenant.
+		Tenants:  tenants,
+		// The fallback when no tenant registry is configured. Strict: nobody
+		// gets substituted by leaving a file absent.
 		Policy: domain.DefaultPolicy(),
 	}
 
-	srv := server.New(gw, store, registry, server.Options{Logger: log})
+	srv := server.New(gw, store, registry, server.Options{
+		Logger:  log,
+		Tenants: tenants,
+		Meter:   mtr,
+		Metrics: mx,
+	})
 
 	httpSrv := &http.Server{
 		Addr:    cfg.addr,
@@ -108,6 +156,39 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	var adminSrv *http.Server
+	if cfg.adminAddr != "" {
+		adminSrv = &http.Server{
+			Addr:              cfg.adminAddr,
+			Handler:           server.NewAdmin(agg, mtr, promReg).Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			log.Info("admin listening", "addr", cfg.adminAddr, "paths", "/metrics /savings")
+			if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				// Not fatal. The control plane going down must not take
+				// inference with it — that is the whole point of the split.
+				log.Error("admin listener stopped", "error", err)
+			}
+		}()
+	}
+
+	// Publish the drop counter periodically. A rising value means the savings
+	// ledger is incomplete, which is a correctness problem for the report
+	// rather than merely a monitoring one.
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				mx.ObserveDropped(mtr.Dropped())
+			}
+		}
+	}()
+
 	errs := make(chan error, 1)
 	go func() {
 		log.Info("relay listening",
@@ -116,6 +197,8 @@ func run() error {
 			"endpoints", len(cat.Endpoints),
 			"routes", len(cat.Routes),
 			"providers", registry.Providers(),
+			"tenants", tenants.IDs(),
+			"ledger", orNone(cfg.ledgerPath),
 		)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errs <- err
@@ -146,8 +229,31 @@ func run() error {
 		log.Warn("drain did not complete", "error", err)
 	}
 
-	log.Info("shutdown complete")
+	// The meter closes *after* the HTTP server has drained, so the records for
+	// in-flight requests are already queued and survive. Closing it first would
+	// silently discard the last few seconds of the ledger on every deploy —
+	// a small, systematic, invisible undercount.
+	mx.ObserveDropped(mtr.Dropped())
+	if err := mtr.Close(drain); err != nil {
+		log.Warn("metering did not flush", "error", err)
+	}
+	if n := mtr.Dropped(); n > 0 {
+		log.Warn("ledger records were dropped; the savings report is incomplete", "dropped", n)
+	}
+
+	if adminSrv != nil {
+		_ = adminSrv.Shutdown(drain)
+	}
+
+	log.Info("shutdown complete", "records_written", mtr.Written())
 	return nil
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "(disabled)"
+	}
+	return s
 }
 
 func newLogger(level, format string) *slog.Logger {

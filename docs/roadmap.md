@@ -59,7 +59,7 @@ Prices in `config/catalog.yaml` are illustrative and must be re-verified before 
 
 ---
 
-## Phase 2 — Baseline and savings accounting (shadow mode)
+## Phase 2 — Baseline and savings accounting (shadow mode) — **built, pending reconciliation**
 
 **Goal: prove the saving before claiming it. First sellable milestone.**
 
@@ -72,7 +72,29 @@ Prices in `config/catalog.yaml` are illustrative and must be re-verified before 
 
 **Why this early.** It is the product's central claim, and until it exists every savings number is an assertion. It is also the entire sales motion: a prospect runs Relay in shadow for a month, changes nothing, and gets a report saying what they would have saved. That is the lowest-risk possible way to adopt a vendor in your critical path.
 
+**The invariant everything else is arranged around.** A shadow saving is not a saving. In shadow mode the baseline *is* served, so `saved` is genuinely zero and the counterfactual figure lives in a separate field — `shadow_saved` — from the ledger through the metrics to the report. Telling a customer that a month of shadow traffic had already banked money it had not is the single most damaging error this product could make, so the two numbers are never summable at any layer, and the report carries the caveat inline rather than only in documentation.
+
+**What it needed that was not on the list.** Two things:
+
+- *Tenancy.* A per-tenant report needs a tenant. `config/tenants.yaml` maps SHA-256-hashed API keys to tenants and their policies; an unkeyed request still works and is attributed to a default tenant, so Phase 1 deployments are unaffected. This is a thin slice of Phase 7 pulled forward, taken because a ledger written without the dimension would have needed re-keying — a migration on billing-adjacent data.
+- *A control-plane listener.* `/metrics` and `/savings` are served on a separate address bound to loopback by default (`-admin-addr`), not on the data plane. Cost data is not public and there is no authentication on it until Phase 7, so the bind address is the control.
+
+**Where the ledger lives.** [ADR-0005](adr/0005-state-store-and-multi-instance.md) names Postgres as the system of record but also requires the data plane to buffer and spill to disk when it is unreachable. Phase 2 builds that spill path first: an append-only JSONL ledger plus an in-memory aggregate. Phase 7 adds a Postgres sink behind the same interface and this one keeps running. Recording never blocks a request — records go to a buffered channel and are dropped with a counter when full, because a gateway that stalls inference to write telemetry has inverted its own priorities.
+
 **Done when:** a week of shadow traffic produces a per-tenant savings report, and the reported cost reconciles against the provider's own dashboard within 1%.
+
+**Verification status.** The report exists and is correct against fixtures and a live smoke run: a mixed shadow/strict/anonymous workload produces correct per-tenant, per-route, and per-day figures, with `saved` at zero and `shadow_saved` populated. Measured gateway overhead was ~28 µs mean against a 5 ms p50 target.
+
+The **reconciliation** half is still open, and cannot be closed here — it requires a real provider invoice to compare against. To close it:
+
+```sh
+# Run shadow traffic for a billing period against a real provider, then:
+jq -s 'map(select(.usage_estimated | not) | .cost_micros) | add / 1e6' data/ledger.jsonl
+# Compare with the provider's own dashboard for the same window; the target is 1%.
+# Exclude usage_estimated records first — their cost is derived, not reported.
+```
+
+Two known sources of drift to check when doing it: requests whose provider returned no usage block (counted as `estimated_usage_requests`, and excluded above), and dropped ledger records under load (`dropped_records` in the report, `relay_meter_dropped_total` in metrics — both should be zero).
 
 ---
 

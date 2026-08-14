@@ -6,11 +6,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/Shashank-Panda/relay/internal/domain"
 	"github.com/Shashank-Panda/relay/internal/execute"
 	"github.com/Shashank-Panda/relay/internal/gateway"
+	"github.com/Shashank-Panda/relay/internal/meter"
 	"github.com/Shashank-Panda/relay/internal/provider"
 	"github.com/Shashank-Panda/relay/internal/routing"
 	"github.com/Shashank-Panda/relay/internal/wire"
@@ -28,9 +30,29 @@ const (
 	HeaderMode        = "X-Relay-Mode"
 	HeaderSubstituted = "X-Relay-Substituted"
 	HeaderCatalog     = "X-Relay-Catalog-Version"
+
+	// HeaderDecision is a compact summary of why this endpoint was chosen.
+	// Bounded deliberately: the full Decision belongs in the ledger and in a
+	// dry-run response, not in a header that proxies may truncate.
+	HeaderDecision = "X-Relay-Decision"
+
+	// HeaderSaved is what this request saved, in USD.
+	//
+	// On a non-streaming response it comes from provider-reported actuals. On a
+	// stream it cannot: headers are fixed before the first byte and the token
+	// counts arrive at the end. Streaming therefore carries the pre-flight
+	// estimate and sets HeaderSavedEstimated so the two are never confused.
+	HeaderSaved          = "X-Relay-Saved-Usd"
+	HeaderSavedEstimated = "X-Relay-Saved-Estimated"
+
+	// HeaderShadowSaved is what optimize mode would have saved. Present only in
+	// shadow mode, and never merged with HeaderSaved: one is money saved, the
+	// other is money that could have been.
+	HeaderShadowSaved = "X-Relay-Shadow-Saved-Usd"
 )
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	r.Body = http.MaxBytesReader(w, r.Body, s.opts.MaxBodyBytes)
 
 	var body wire.ChatRequest
@@ -53,7 +75,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	req.ID = RequestID(r.Context())
 
-	prepared, err := s.gw.Prepare(req, body.Model, r.Header.Get(HeaderPin))
+	tn := tenantOf(r.Context(), s.tenants)
+
+	prepared, err := s.gw.Prepare(req, tn, body.Model, r.Header.Get(HeaderPin))
 	if err != nil {
 		s.writePrepareError(w, err)
 		return
@@ -62,10 +86,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.setDisclosureHeaders(w, prepared)
 
 	if req.Stream {
-		s.streamCompletion(w, r, prepared)
+		s.streamCompletion(w, r, prepared, start)
 		return
 	}
-	s.chatCompletion(w, r, prepared)
+	s.chatCompletion(w, r, prepared, start)
 }
 
 // writePrepareError reports a failure that happened before any provider was
@@ -122,18 +146,100 @@ func (s *Server) setDisclosureHeaders(w http.ResponseWriter, p *gateway.Prepared
 		// what the caller named.
 		h.Set(HeaderSubstituted, "true")
 	}
+	h.Set(HeaderDecision, decisionSummary(d))
 }
 
-func (s *Server) chatCompletion(w http.ResponseWriter, r *http.Request, p *gateway.Prepared) {
-	resp, served, att, err := s.gw.Chat(r.Context(), p)
+// decisionSummary renders the ranking compactly enough for a header.
+//
+// Top three only, and no reasons. A header is a bounded medium — proxies vary,
+// and an 8KB limit is common — so this is the summary that says *what* was
+// decided; the ledger and the dry-run endpoint carry the full explanation.
+func decisionSummary(d *domain.Decision) string {
+	type entry struct {
+		Endpoint string  `json:"endpoint"`
+		Total    float64 `json:"total"`
+	}
+	out := struct {
+		Route          string  `json:"route,omitempty"`
+		Chosen         string  `json:"chosen"`
+		Counterfactual string  `json:"counterfactual,omitempty"`
+		Mode           string  `json:"mode"`
+		Ranked         []entry `json:"ranked,omitempty"`
+		Rejected       int     `json:"rejected,omitempty"`
+		Fallback       bool    `json:"fallback,omitempty"`
+	}{
+		Route:          d.RouteName,
+		Chosen:         d.Chosen,
+		Counterfactual: d.Counterfactual,
+		Mode:           string(d.Baseline.Mode),
+		Rejected:       len(d.Rejected),
+		Fallback:       d.UsedFallback,
+	}
+	for i, c := range d.Ranked {
+		if i == 3 {
+			break
+		}
+		out.Ranked = append(out.Ranked, entry{c.EndpointID, round3(c.Total)})
+	}
+
+	buf, err := json.Marshal(out)
 	if err != nil {
+		return ""
+	}
+	return string(buf)
+}
+
+func round3(f float64) float64 { return float64(int(f*1000+0.5)) / 1000 }
+
+// setSavingsHeaders reports the money figures once they are known.
+func (s *Server) setSavingsHeaders(w http.ResponseWriter, rec *meter.Record, estimated bool) {
+	if !rec.SavingMeasured {
+		return
+	}
+	h := w.Header()
+	h.Set(HeaderSaved, usd(rec.Saved))
+	if estimated {
+		// The caller must be able to tell a measured figure from a pre-flight
+		// one. A dashboard that summed both would be summing guesses.
+		h.Set(HeaderSavedEstimated, "true")
+	}
+	if rec.Counterfactual != "" {
+		h.Set(HeaderShadowSaved, usd(rec.ShadowSaved))
+	}
+}
+
+func usd(m domain.Money) string {
+	return strconv.FormatFloat(m.Dollars(), 'f', 6, 64)
+}
+
+func (s *Server) chatCompletion(w http.ResponseWriter, r *http.Request, p *gateway.Prepared, start time.Time) {
+	rec := p.NewRecord(false)
+	rec.At = start
+
+	providerStart := time.Now()
+	resp, _, att, err := s.gw.Chat(r.Context(), p)
+	rec.ProviderDuration = time.Since(providerStart)
+
+	if err != nil {
+		rec.Outcome = outcomeFor(err)
+		rec.ErrorClass = string(provider.ClassOf(err))
+		rec.Duration = time.Since(start)
+		s.record(rec)
+
 		s.logAttempt(r, p, att, nil)
 		wire.WriteProviderError(w, err)
 		return
 	}
 
-	cost, baseline, measured := p.Cost(resp.Usage, served)
-	s.logCompletion(r, p, att, resp.Usage, cost, baseline, measured)
+	p.Price(&rec, resp.Usage)
+	rec.Outcome = meter.OutcomeSuccess
+	rec.Duration = time.Since(start)
+
+	// Non-streaming can report actuals, because nothing has been written yet.
+	s.setSavingsHeaders(w, &rec, false)
+
+	s.record(rec)
+	s.logCompletion(r, p, rec)
 
 	writeJSON(w, http.StatusOK, wire.EncodeResponse(resp, p.RequestedModel, time.Now().Unix()))
 }
@@ -149,9 +255,23 @@ func (s *Server) chatCompletion(w http.ResponseWriter, r *http.Request, p *gatew
 //     the request context;
 //   - a client disconnect propagates upstream, because r.Context() is what the
 //     provider call was built from.
-func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gateway.Prepared) {
-	stream, served, att, err := s.gw.Stream(r.Context(), p)
+func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gateway.Prepared, start time.Time) {
+	rec := p.NewRecord(true)
+	rec.At = start
+
+	// The estimate is all that can be known before the first byte, and the
+	// header must be written now or not at all.
+	s.setEstimatedSavings(w, p)
+
+	providerStart := time.Now()
+	stream, _, att, err := s.gw.Stream(r.Context(), p)
 	if err != nil {
+		rec.ProviderDuration = time.Since(providerStart)
+		rec.Duration = time.Since(start)
+		rec.Outcome = outcomeFor(err)
+		rec.ErrorClass = string(provider.ClassOf(err))
+		s.record(rec)
+
 		s.logAttempt(r, p, att, nil)
 		// Nothing has been written yet, so this is still a normal JSON error
 		// with a real status code. After the first frame it could not be.
@@ -160,24 +280,40 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gat
 	}
 	defer stream.Close()
 
+	s.streamsOpened()
+	defer s.streamsClosed()
+
 	sw := wire.NewStreamWriter(w)
 	id := "chatcmpl-" + p.Request.ID
 	created := time.Now().Unix()
+
+	finish := func(outcome meter.Outcome, err error) {
+		rec.ProviderDuration = time.Since(providerStart)
+		rec.Duration = time.Since(start)
+		rec.Outcome = outcome
+		if err != nil {
+			rec.ErrorClass = string(provider.ClassOf(err))
+		}
+		s.record(rec)
+	}
 
 	// The opening frame carries only role:"assistant". SDKs that build a
 	// message incrementally use it to initialise the object; without it the
 	// first content delta is applied to nothing.
 	if err := sw.Send(wire.RoleChunk(id, p.RequestedModel, created)); err != nil {
+		finish(meter.OutcomeCancelled, err)
 		s.logAttempt(r, p, att, nil)
 		return
 	}
 
+	var firstToken time.Time
 	for {
 		chunk, err := stream.Recv()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
+			finish(outcomeFor(err), err)
 			s.logAttempt(r, p, att, err)
 			// Past the first byte the status code is already sent, so the only
 			// honest way to report this is inside the stream. Closing the
@@ -188,9 +324,15 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gat
 			return
 		}
 
+		if firstToken.IsZero() && (chunk.Text != "" || chunk.ToolCall != nil) {
+			firstToken = time.Now()
+			rec.TTFT = firstToken.Sub(start)
+		}
+
 		if err := sw.Send(wire.EncodeChunk(chunk, id, p.RequestedModel, created)); err != nil {
 			// The client is gone. Returning cancels r.Context(), which aborts
 			// the upstream call and stops the meter.
+			finish(meter.OutcomeCancelled, err)
 			s.logDisconnect(r, p, att)
 			return
 		}
@@ -203,14 +345,68 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gat
 
 	if !usage.Estimated {
 		if err := sw.Send(wire.UsageChunk(usage, id, p.RequestedModel, created)); err != nil {
+			finish(meter.OutcomeCancelled, err)
 			s.logDisconnect(r, p, att)
 			return
 		}
 	}
 	_ = sw.Done()
 
-	cost, baseline, measured := p.Cost(usage, served)
-	s.logCompletion(r, p, att, usage, cost, baseline, measured)
+	// Priced from actuals even though the header could not be: the ledger is
+	// what the savings report is built from, and it has no such constraint.
+	p.Price(&rec, usage)
+	finish(meter.OutcomeSuccess, nil)
+	s.logCompletion(r, p, rec)
+}
+
+// setEstimatedSavings writes the pre-flight figure for a streaming response.
+//
+// Estimated because output length is unknowable before generation. Flagged as
+// such, rather than omitted, because a caller watching a stream still wants a
+// signal — and rather than presented as measured, because that would put a
+// guess into a field a dashboard might sum.
+func (s *Server) setEstimatedSavings(w http.ResponseWriter, p *gateway.Prepared) {
+	d := p.Decision
+	if !d.SavingMeasured {
+		return
+	}
+	h := w.Header()
+	h.Set(HeaderSaved, usd(d.EstimatedSaved))
+	h.Set(HeaderSavedEstimated, "true")
+	if shadow, ok := d.ShadowSaving(); ok {
+		h.Set(HeaderShadowSaved, usd(shadow))
+	}
+}
+
+func (s *Server) record(rec meter.Record) {
+	if s.meter == nil {
+		return
+	}
+	s.meter.Record(rec)
+}
+
+func (s *Server) streamsOpened() {
+	if s.metrics != nil {
+		s.metrics.StreamsActive.Inc()
+	}
+}
+
+func (s *Server) streamsClosed() {
+	if s.metrics != nil {
+		s.metrics.StreamsActive.Dec()
+	}
+}
+
+func outcomeFor(err error) meter.Outcome {
+	if err == nil {
+		return meter.OutcomeSuccess
+	}
+	if provider.ClassOf(err) == provider.ClassCancelled {
+		// A client hanging up is not a failure of Relay's, and counting it as
+		// one would put every cancelled stream into the error budget.
+		return meter.OutcomeCancelled
+	}
+	return meter.OutcomeError
 }
 
 // providerMessage extracts a caller-safe description.
@@ -232,28 +428,35 @@ func providerMessage(err error) string {
 // makes that a product commitment rather than a configuration flag someone
 // might forget to set, and the way to keep a commitment like that is to have no
 // code path that could violate it.
-func (s *Server) logCompletion(
-	r *http.Request, p *gateway.Prepared, att execute.Attempt,
-	u provider.Usage, cost, baseline domain.Money, measured bool,
-) {
+func (s *Server) logCompletion(r *http.Request, p *gateway.Prepared, rec meter.Record) {
 	attrs := []slog.Attr{
-		slog.String("request_id", p.Request.ID),
-		slog.String("model_requested", p.RequestedModel),
-		slog.String("endpoint", att.EndpointID),
-		slog.String("route", p.Decision.RouteName),
-		slog.String("catalog_version", p.Decision.CatalogVersion),
-		slog.Int("input_tokens", u.InputTokens),
-		slog.Int("cached_input_tokens", u.CachedInputTokens),
-		slog.Int("output_tokens", u.OutputTokens),
-		slog.Bool("usage_estimated", u.Estimated),
-		slog.String("cost", cost.String()),
-		slog.Bool("substituted", p.Decision.Substituted()),
+		slog.String("request_id", rec.RequestID),
+		slog.String("tenant", rec.Tenant),
+		slog.String("model_requested", rec.RequestedModel),
+		slog.String("endpoint", rec.Endpoint),
+		slog.String("route", rec.RouteName),
+		slog.String("mode", string(rec.Mode)),
+		slog.String("catalog_version", rec.CatalogVersion),
+		slog.Int("input_tokens", rec.InputTokens),
+		slog.Int("cached_input_tokens", rec.CachedInputTokens),
+		slog.Int("output_tokens", rec.OutputTokens),
+		slog.Bool("usage_estimated", rec.UsageEstimated),
+		slog.String("cost", rec.Cost.String()),
+		slog.Bool("substituted", rec.Substituted),
+		slog.Duration("duration", rec.Duration),
+		slog.Duration("overhead", rec.Overhead()),
 	}
-	if measured {
+	if rec.SavingMeasured {
 		attrs = append(attrs,
-			slog.String("baseline_cost", baseline.String()),
-			slog.String("saved", (baseline-cost).String()),
+			slog.String("baseline_cost", rec.BaselineCost.String()),
+			slog.String("saved", rec.Saved.String()),
 		)
+		if rec.Counterfactual != "" {
+			attrs = append(attrs,
+				slog.String("counterfactual", rec.Counterfactual),
+				slog.String("shadow_saved", rec.ShadowSaved.String()),
+			)
+		}
 	} else {
 		// Unmeasured is not zero. Recording it as zero would let it be summed
 		// with real measurements and quietly dilute every savings report that
@@ -280,6 +483,7 @@ func (s *Server) logAttempt(r *http.Request, p *gateway.Prepared, att execute.At
 
 	s.log.LogAttrs(r.Context(), level, "attempt failed",
 		slog.String("request_id", p.Request.ID),
+		slog.String("tenant", p.TenantID()),
 		slog.String("endpoint", att.EndpointID),
 		slog.String("error_class", string(class)),
 		slog.String("error", errString(err)),
@@ -289,6 +493,7 @@ func (s *Server) logAttempt(r *http.Request, p *gateway.Prepared, att execute.At
 func (s *Server) logDisconnect(r *http.Request, p *gateway.Prepared, att execute.Attempt) {
 	s.log.LogAttrs(r.Context(), slog.LevelInfo, "client disconnected mid-stream",
 		slog.String("request_id", p.Request.ID),
+		slog.String("tenant", p.TenantID()),
 		slog.String("endpoint", att.EndpointID),
 	)
 }

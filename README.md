@@ -10,15 +10,22 @@ The two things that make it a product rather than a proxy: **it never substitute
 
 ## Status
 
-**Phase 1 built, phases 2–8 not started.** Relay serves `/v1/chat/completions` (streaming and non-streaming), `/v1/models`, `/healthz`, and `/readyz` against Ollama, OpenAI, and Anthropic. Routing, the catalog loader, and the request optimizer are implemented and tested but not yet reachable from the request path: **every request runs in `strict` mode and is served exactly as asked.** Nothing is substituted and no savings are recorded yet — that is [Phase 2](docs/roadmap.md).
+**Phases 1–2 built, phases 3–8 not started.** Relay serves `/v1/chat/completions` (streaming and non-streaming), `/v1/models`, `/healthz`, and `/readyz` against Ollama, OpenAI, and Anthropic, and records a per-request savings ledger.
+
+`strict` and `shadow` modes work, per tenant. **Nothing is ever substituted yet** — `optimize` mode is [Phase 5](docs/roadmap.md). Shadow mode serves exactly what was asked and records what a cheaper route *would* have cost on the same tokens, which is the whole point: a customer can measure a month of savings before granting permission to change anything.
 
 ```sh
 go test ./...
 export RELAY_CRED_ANTHROPIC_PRIMARY=sk-ant-...    # or RELAY_CRED_OPENAI_PRIMARY
-go run ./cmd/relay -catalog config/catalog.yaml   # listens on :8080
+go run ./cmd/relay                                # data plane :8080, admin 127.0.0.1:9090
+
+curl -s localhost:9090/savings?tenant=acme        # the savings report
+curl -s localhost:9090/metrics                    # Prometheus
 ```
 
-Prices in `config/catalog.yaml` are illustrative. Re-verify them against each provider's pricing page before pointing this at real traffic — the loader refuses an attestation older than 90 days.
+**`saved` and `shadow_saved` are different numbers and are never summed.** In shadow mode the baseline is served, so nothing is actually saved; `shadow_saved` is what optimization *would* have saved. That separation runs from the ledger through the metrics to the report, because reporting the second as the first would tell a customer they had banked money they had not.
+
+Prices in `config/catalog.yaml` are illustrative. Re-verify them against each provider's pricing page before pointing this at real traffic — the loader refuses an attestation older than 90 days. Tenant API keys live in `config/tenants.yaml` as SHA-256 digests; a missing file means every request is anonymous, which is what Phase 1 did.
 
 The [roadmap](docs/roadmap.md) describes what gets built in what order; [`docs/adr/`](docs/adr/) records the decisions, including the ones still open.
 

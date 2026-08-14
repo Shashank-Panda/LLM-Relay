@@ -53,6 +53,16 @@ type Decision struct {
 	// shadow mode, where Chosen is the baseline and this is the road not taken.
 	Counterfactual string
 
+	// CounterfactualCost prices the counterfactual endpoint. Set only in shadow
+	// mode, and it is the number the whole mode exists to produce.
+	//
+	// It is not EstimatedSaved. In shadow mode the baseline *is* served, so the
+	// actual saving is genuinely zero — reporting the counterfactual saving
+	// there would claim money that was never saved. The shadow figure is
+	// BaselineCost − CounterfactualCost, kept in its own field so the two can
+	// never be summed by accident.
+	CounterfactualCost Money
+
 	Ranked   []ScoredCandidate
 	Rejected []RejectedCandidate
 
@@ -77,4 +87,17 @@ type Decision struct {
 // asked for. When true, disclosure headers are mandatory, not optional.
 func (d *Decision) Substituted() bool {
 	return d.Baseline.EndpointID != "" && d.Chosen != d.Baseline.EndpointID
+}
+
+// ShadowSaving is what optimize mode would have saved on this request.
+//
+// Reported separately from EstimatedSaved and never added to it: one is money
+// that was saved, the other is money that could have been. A ledger that summed
+// them would report a customer's shadow month as though they had already banked
+// it, which is the single most damaging error this product could make.
+func (d *Decision) ShadowSaving() (Money, bool) {
+	if d.Counterfactual == "" || !d.SavingMeasured {
+		return 0, false
+	}
+	return d.BaselineCost - d.CounterfactualCost, true
 }

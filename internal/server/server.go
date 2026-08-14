@@ -12,7 +12,10 @@ import (
 
 	"github.com/Shashank-Panda/relay/internal/catalog"
 	"github.com/Shashank-Panda/relay/internal/gateway"
+	"github.com/Shashank-Panda/relay/internal/meter"
+	"github.com/Shashank-Panda/relay/internal/metrics"
 	"github.com/Shashank-Panda/relay/internal/provider"
+	"github.com/Shashank-Panda/relay/internal/tenant"
 )
 
 // Options configures the server.
@@ -28,6 +31,18 @@ type Options struct {
 	StreamHeartbeat time.Duration
 
 	Logger *slog.Logger
+
+	// Tenants resolves API keys. Nil means every request is anonymous and runs
+	// under the default policy, which is Phase 1's behaviour.
+	Tenants *tenant.Registry
+
+	// Meter receives one ledger record per request. Nil disables metering
+	// entirely — the request path is unaffected either way, because recording
+	// never blocks.
+	Meter *meter.Meter
+
+	// Metrics is the Prometheus instrumentation. Nil disables it.
+	Metrics *metrics.Metrics
 }
 
 func DefaultOptions() Options {
@@ -45,6 +60,12 @@ type Server struct {
 	opts     Options
 	log      *slog.Logger
 
+	// tenants and meter may both be nil, in which case Phase 1's behaviour
+	// applies: every request anonymous, nothing recorded.
+	tenants *tenant.Registry
+	meter   *meter.Meter
+	metrics *metrics.Metrics
+
 	// ready flips to false the instant shutdown begins, so load balancers stop
 	// sending traffic before the socket closes. A process that reports healthy
 	// while draining collects requests it has already decided not to finish.
@@ -60,7 +81,13 @@ func New(gw *gateway.Gateway, store *catalog.Store, registry *provider.Registry,
 		opts.Logger = d.Logger
 	}
 
-	s := &Server{gw: gw, store: store, registry: registry, opts: opts, log: opts.Logger}
+	s := &Server{
+		gw: gw, store: store, registry: registry,
+		opts: opts, log: opts.Logger,
+		tenants: opts.Tenants,
+		meter:   opts.Meter,
+		metrics: opts.Metrics,
+	}
 	s.ready.Store(true)
 	return s
 }
@@ -83,6 +110,11 @@ func (s *Server) Handler() http.Handler {
 		withRequestID,
 		withRecovery(s.log),
 		withAccessLog(s.log),
+		// Authentication runs innermost, after recovery and logging, so a
+		// rejected request still gets a request ID and an access-log line. An
+		// auth failure nobody can find in the logs is an auth failure nobody
+		// can debug.
+		withTenant(s.tenants),
 	)
 }
 

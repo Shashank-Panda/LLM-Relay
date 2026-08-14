@@ -6,8 +6,10 @@ import (
 	"github.com/Shashank-Panda/relay/internal/catalog"
 	"github.com/Shashank-Panda/relay/internal/domain"
 	"github.com/Shashank-Panda/relay/internal/execute"
+	"github.com/Shashank-Panda/relay/internal/meter"
 	"github.com/Shashank-Panda/relay/internal/provider"
 	"github.com/Shashank-Panda/relay/internal/routing"
+	"github.com/Shashank-Panda/relay/internal/tenant"
 )
 
 // Gateway wires the pipeline stages together.
@@ -15,10 +17,28 @@ type Gateway struct {
 	Store    *catalog.Store
 	Executor *execute.Executor
 
-	// Policy is the tenant policy. Phase 1 has one, for everybody; Phase 7
-	// makes it per-tenant, which changes how this field is populated and
-	// nothing about how it is used.
+	// Tenants resolves an API key to a tenant and its policy. Nil means every
+	// request is anonymous and runs under the default policy, which is Phase 1's
+	// behaviour and is still supported.
+	Tenants *tenant.Registry
+
+	// Policy is the fallback when no tenant registry is configured.
 	Policy *domain.Policy
+}
+
+// policyFor returns the policy a request runs under.
+//
+// Per-tenant rather than process-wide, because the adoption story is one
+// customer trying shadow mode while everybody else stays strict. A global flag
+// would make that impossible without a second deployment.
+func (g *Gateway) policyFor(t *tenant.Tenant) *domain.Policy {
+	if t != nil && t.Policy != nil {
+		return t.Policy
+	}
+	if g.Policy != nil {
+		return g.Policy
+	}
+	return domain.DefaultPolicy()
 }
 
 // Prepared is a request that has been routed but not yet executed.
@@ -36,6 +56,9 @@ type Prepared struct {
 	// RequestedModel is what the caller put in the model field. Echoed back
 	// verbatim, because clients key caches and dashboards on it.
 	RequestedModel string
+
+	// Tenant owns this request and its costs.
+	Tenant *tenant.Tenant
 }
 
 // Prepare resolves the baseline and routes the request.
@@ -44,18 +67,18 @@ type Prepared struct {
 // catalog snapshot. The snapshot is taken once, at the top, so a request that
 // begins under catalog version N completes under version N even if a reload
 // lands mid-flight.
-func (g *Gateway) Prepare(req *domain.NormalizedRequest, model, pin string) (*Prepared, error) {
+func (g *Gateway) Prepare(req *domain.NormalizedRequest, tn *tenant.Tenant, model, pin string) (*Prepared, error) {
 	cat := g.Store.Current()
 	if cat == nil {
 		return nil, &ErrUnknownModel{Model: model}
 	}
 
-	pol := g.Policy
-	if pol == nil {
-		pol = domain.DefaultPolicy()
-	}
-
+	pol := g.policyFor(tn)
 	mode := ResolveMode(pin, pol)
+
+	if tn != nil {
+		req.Tenant = tn.ID
+	}
 
 	routeName, baseline, err := ResolveBaseline(cat, model, mode)
 	if err != nil {
@@ -82,7 +105,40 @@ func (g *Gateway) Prepare(req *domain.NormalizedRequest, model, pin string) (*Pr
 		Catalog:        cat,
 		Decision:       d,
 		RequestedModel: model,
+		Tenant:         tn,
 	}, nil
+}
+
+// TenantID is the identifier every ledger entry is filed under.
+func (p *Prepared) TenantID() string {
+	if p.Tenant == nil {
+		return tenant.DefaultID
+	}
+	return p.Tenant.ID
+}
+
+// NewRecord builds a ledger entry from everything decided before execution.
+//
+// The costs are filled in afterwards by Record.Price, once the provider has
+// reported actual token counts. Estimates are for admission control and routing
+// only; the ledger uses actuals (architecture §8).
+func (p *Prepared) NewRecord(streaming bool) meter.Record {
+	d := p.Decision
+	return meter.Record{
+		RequestID:      p.Request.ID,
+		Tenant:         p.TenantID(),
+		RouteName:      d.RouteName,
+		CatalogVersion: d.CatalogVersion,
+		PolicyVersion:  d.PolicyVersion,
+		Mode:           d.Baseline.Mode,
+		RequestedModel: p.RequestedModel,
+		Endpoint:       d.Chosen,
+		BaselineID:     d.Baseline.EndpointID,
+		BaselineSource: d.Baseline.Source,
+		Streaming:      streaming,
+		Substituted:    d.Substituted(),
+		UsedFallback:   d.UsedFallback,
+	}
 }
 
 // Chat executes a prepared non-streaming request.
@@ -96,22 +152,18 @@ func (g *Gateway) Stream(ctx context.Context, p *Prepared) (provider.Stream, *do
 	return g.Executor.Stream(ctx, p.Request, p.Catalog, p.Decision)
 }
 
-// Cost prices reported usage against the served endpoint and the baseline.
+// Price fills a record's cost figures from reported usage.
 //
-// Both figures come from the *same* token counts, priced two ways. That is the
-// whole measurement: the input-token baseline is exact, and the output-token
-// baseline is the actual output count at baseline rates rather than a modelled
-// guess at what a different model would have produced. Documenting that
-// approximation is more honest than hiding it inside a model nobody can audit.
-func (p *Prepared) Cost(u provider.Usage, served *domain.ModelEndpoint) (cost, baseline domain.Money, measured bool) {
-	cost = u.Cost(served)
-
-	if !p.Decision.SavingMeasured {
-		return cost, 0, false
-	}
-	base, ok := p.Catalog.Endpoint(p.Decision.Baseline.EndpointID)
-	if !ok {
-		return cost, 0, false
-	}
-	return cost, u.Cost(base), true
+// Every figure comes from the *same* token counts, priced two or three ways
+// against the catalog snapshot this request was routed under. The input-token
+// baseline is exact; the output-token baseline is the actual output count at
+// baseline rates rather than a modelled guess at what a different model would
+// have produced. That approximation is documented rather than hidden inside a
+// model nobody can audit.
+//
+// Delegating to meter.Record keeps the invariants between Cost, BaselineCost,
+// Saved, and ShadowSaved in one place. They are easy to get subtly wrong and a
+// savings report is built entirely out of them.
+func (p *Prepared) Price(r *meter.Record, u provider.Usage) {
+	r.Price(u, p.Catalog, p.Decision)
 }
