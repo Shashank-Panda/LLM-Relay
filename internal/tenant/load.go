@@ -47,6 +47,43 @@ type policyYAML struct {
 	MaxCostPerRequestUSD float64 `yaml:"max_cost_per_request_usd"`
 
 	QualityFloor map[string]float64 `yaml:"quality_floor"`
+
+	// Levers selects the request optimizations this tenant has agreed to.
+	//
+	// Separate from optimization_mode, and the separation is the point. Mode
+	// governs whether Relay may serve a *different model*; levers govern whether
+	// it may rewrite the request it sends to the model the tenant asked for.
+	// A strict-mode tenant can hold the first line and still take the savings
+	// from the second, which is the whole reason the levers ship before routing
+	// does (ADR-0008).
+	Levers leversYAML `yaml:"levers"`
+}
+
+// leversYAML mirrors domain.LeverConfig, with a preset shorthand.
+//
+// The zero value enables nothing, matching the domain type: a tenant should
+// never discover their requests are being rewritten because a field was left
+// blank.
+type leversYAML struct {
+	// Preset applies a named starting point that individual fields then
+	// override. "recommended" enables the two semantics-preserving levers.
+	Preset string `yaml:"preset"`
+
+	CacheBreakpoints *bool `yaml:"cache_breakpoints"`
+	EffortDownshift  *bool `yaml:"effort_downshift"`
+	OutputCeiling    *bool `yaml:"output_ceiling"`
+	ContextPruning   *bool `yaml:"context_pruning"`
+
+	MinCacheableTokens int `yaml:"min_cacheable_tokens"`
+	MaxBreakpoints     int `yaml:"max_breakpoints"`
+
+	DefaultEffort string `yaml:"default_effort"`
+
+	OutputCeilingSlack float64 `yaml:"output_ceiling_slack"`
+	MinOutputCeiling   int     `yaml:"min_output_ceiling"`
+	MaxOutputCeiling   int     `yaml:"max_output_ceiling"`
+
+	KeepTurns int `yaml:"keep_turns"`
 }
 
 // Problem is one defect, located by a path into the file.
@@ -214,7 +251,99 @@ func convert(ty tenantYAML, path string, add func(string, string, ...any)) *Tena
 		}
 	}
 
+	pol.Levers = convertLevers(ty.Policy.Levers, path+".policy.levers", add)
+
 	return &Tenant{ID: ty.ID, Name: ty.Name, Policy: pol}
+}
+
+// convertLevers turns the file's lever block into a bounded LeverConfig.
+//
+// Every bound is applied here rather than at use, because "bounded by policy"
+// has to mean bounded at the edge. A lever that trusts its own configuration and
+// clamps at the point of use has as many places to be wrong as it has callers.
+func convertLevers(y leversYAML, path string, add func(string, string, ...any)) domain.LeverConfig {
+	var cfg domain.LeverConfig
+
+	switch y.Preset {
+	case "":
+	case "recommended":
+		cfg = domain.RecommendedLevers()
+	case "none":
+		// Explicit and equivalent to the zero value. Worth accepting so an
+		// operator can state the intent rather than express it by omission.
+	default:
+		add(path+".preset", "%q is not one of recommended, none", y.Preset)
+	}
+
+	// Pointers so that `output_ceiling: false` can switch a preset's lever off.
+	// With a plain bool, false is indistinguishable from unset, and a tenant
+	// trying to disable one lever from a preset would silently keep it.
+	setBool(&cfg.CacheBreakpoints, y.CacheBreakpoints)
+	setBool(&cfg.EffortDownshift, y.EffortDownshift)
+	setBool(&cfg.OutputCeiling, y.OutputCeiling)
+	setBool(&cfg.ContextPruning, y.ContextPruning)
+
+	setPositive(&cfg.MinCacheableTokens, y.MinCacheableTokens, path+".min_cacheable_tokens", add)
+	setPositive(&cfg.MaxBreakpoints, y.MaxBreakpoints, path+".max_breakpoints", add)
+	setPositive(&cfg.MinOutputCeiling, y.MinOutputCeiling, path+".min_output_ceiling", add)
+	setPositive(&cfg.MaxOutputCeiling, y.MaxOutputCeiling, path+".max_output_ceiling", add)
+	setPositive(&cfg.KeepTurns, y.KeepTurns, path+".keep_turns", add)
+
+	if y.DefaultEffort != "" {
+		e := domain.ReasoningEffort(y.DefaultEffort)
+		if !e.Valid() {
+			add(path+".default_effort", "%q is not one of minimal, low, medium, high",
+				y.DefaultEffort)
+		} else {
+			cfg.DefaultEffort = e
+		}
+	}
+
+	if s := y.OutputCeilingSlack; s != 0 {
+		if s < 1 {
+			// Below 1 the ceiling lands under the observed p95, which truncates
+			// the majority of responses on that route. Rejected rather than
+			// clamped: the operator meant something, and it was not this.
+			add(path+".output_ceiling_slack",
+				"is %v; must be at least 1, or the ceiling truncates most responses", s)
+		} else {
+			cfg.OutputCeilingSlack = s
+		}
+	}
+
+	// Levers that are on but unconfigured would silently never fire, which
+	// reads as "optimization is broken" rather than as "a field is missing".
+	if cfg.CacheBreakpoints && (cfg.MaxBreakpoints <= 0 || cfg.MinCacheableTokens <= 0) {
+		add(path, "cache_breakpoints needs max_breakpoints and min_cacheable_tokens "+
+			"(or preset: recommended)")
+	}
+	if cfg.OutputCeiling && cfg.OutputCeilingSlack < 1 {
+		add(path, "output_ceiling needs output_ceiling_slack >= 1 (or preset: recommended)")
+	}
+	if cfg.EffortDownshift && !cfg.DefaultEffort.Valid() {
+		add(path, "effort_downshift needs default_effort")
+	}
+	if cfg.ContextPruning && cfg.KeepTurns <= 0 {
+		add(path, "context_pruning needs keep_turns")
+	}
+
+	return cfg
+}
+
+func setBool(dst *bool, v *bool) {
+	if v != nil {
+		*dst = *v
+	}
+}
+
+func setPositive(dst *int, v int, path string, add func(string, string, ...any)) {
+	switch {
+	case v == 0: // unset; keep whatever the preset supplied
+	case v < 0:
+		add(path, "must not be negative")
+	default:
+		*dst = v
+	}
 }
 
 func isSHA256Hex(s string) bool {

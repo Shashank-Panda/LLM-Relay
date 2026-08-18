@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Shashank-Panda/relay/internal/domain"
@@ -49,6 +50,29 @@ const (
 	// shadow mode, and never merged with HeaderSaved: one is money saved, the
 	// other is money that could have been.
 	HeaderShadowSaved = "X-Relay-Shadow-Saved-Usd"
+
+	// HeaderOptimizations lists the levers applied to this request, as
+	// "lever=before>after" pairs.
+	//
+	// Present on every optimized response, not on request. An optimization the
+	// customer cannot see is indistinguishable from a bug, and "shorter than
+	// yesterday's answer" is a support ticket this header answers on its own
+	// (ADR-0008).
+	HeaderOptimizations = "X-Relay-Optimizations"
+
+	// HeaderCache reports the response cache: hit, miss, or off with a reason.
+	HeaderCache = "X-Relay-Cache"
+
+	// HeaderNoCache lets a caller bypass the response cache for one request.
+	//
+	// Spelled as a request header rather than a body field because the body is
+	// the OpenAI schema and adding to it would break client libraries — the same
+	// constraint that makes the model string carry routing intent.
+	HeaderNoCache = "X-Relay-No-Cache"
+
+	// HeaderDryRun asks what Relay would do, without doing it. Answered with the
+	// full decision and the optimizations, and no provider is contacted.
+	HeaderDryRun = "X-Relay-Dry-Run"
 )
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -77,13 +101,29 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tn := tenantOf(r.Context(), s.tenants)
 
+	if truthy(r.Header.Get(HeaderNoCache)) {
+		// Suppressed before Prepare rather than checked at lookup, so that one
+		// flag turns off both the read and the write. A bypass that still
+		// populated the cache would let a caller asking for a fresh answer
+		// decide what everyone else gets served.
+		req.NoCache = true
+	}
+
 	prepared, err := s.gw.Prepare(req, tn, body.Model, r.Header.Get(HeaderPin))
 	if err != nil {
 		s.writePrepareError(w, err)
 		return
 	}
 
+	s.observeOptimize(prepared)
 	s.setDisclosureHeaders(w, prepared)
+
+	if truthy(r.Header.Get(HeaderDryRun)) {
+		// Answered before any provider contact and before any ledger record:
+		// nothing happened, so nothing is billed and nothing is counted.
+		writeJSON(w, http.StatusOK, dryRun(prepared))
+		return
+	}
 
 	if req.Stream {
 		s.streamCompletion(w, r, prepared, start)
@@ -147,6 +187,80 @@ func (s *Server) setDisclosureHeaders(w http.ResponseWriter, p *gateway.Prepared
 		h.Set(HeaderSubstituted, "true")
 	}
 	h.Set(HeaderDecision, decisionSummary(d))
+
+	if len(d.Optimizations) > 0 {
+		h.Set(HeaderOptimizations, optimizationSummary(d.Optimizations))
+	}
+	// Reported before the lookup happens, so a stream — whose headers are fixed
+	// before its first byte — still says something true. A hit upgrades this to
+	// "hit" while the response is still headers-only; anything left at "miss"
+	// was one.
+	if p.CacheKey != "" {
+		h.Set(HeaderCache, "miss")
+	} else if p.CacheSkip != "" {
+		h.Set(HeaderCache, "off; "+string(p.CacheSkip))
+	}
+}
+
+// optimizationSummary renders the applied levers for a header.
+//
+// Names and values, no reasons. Same constraint as the decision summary: a
+// header is a bounded medium, and the reasons are in the dry-run response and
+// the completion log where there is room for them.
+func optimizationSummary(ops []domain.Optimization) string {
+	parts := make([]string, 0, len(ops))
+	for _, o := range ops {
+		parts = append(parts, o.String())
+	}
+	return strings.Join(parts, ", ")
+}
+
+// observeOptimize publishes the optimizer's latency and any fail-open it took.
+//
+// Recorded for every request including the ones where no lever was enabled,
+// because the histogram answers "what does the optimizer cost us" and a sample
+// set drawn only from the passes that did work answers a different question.
+func (s *Server) observeOptimize(p *gateway.Prepared) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.ObserveOptimize(p.Optimize)
+}
+
+// observeCacheOutcome counts a cacheable request that found no entry.
+//
+// Called after the lookup rather than beside it, because "cacheable" and "miss"
+// are different facts and only one of them is known before execution. Hits are
+// counted from the ledger record instead, where the tenant and route are already
+// on hand — so the two counters come from the two places that actually know.
+func (s *Server) observeCacheOutcome(p *gateway.Prepared) {
+	if s.metrics == nil || p.CacheKey == "" || p.CacheHit {
+		return
+	}
+	s.metrics.ObserveCacheMiss(p.TenantID(), p.Decision.RouteName)
+}
+
+// setCacheHeaders corrects the pre-flight cache header once the answer's origin
+// is known. Safe on a stream because it runs before the first frame.
+func setCacheHeaders(w http.ResponseWriter, p *gateway.Prepared) {
+	if p.CacheHit {
+		w.Header().Set(HeaderCache, "hit")
+	}
+}
+
+// truthy reads a boolean request header.
+//
+// Permissive on purpose. These headers are typed by hand into curl and into
+// client config, and "1", "true", and "yes" all obviously mean the same thing;
+// rejecting two of the three would make the feature look broken. An unset or
+// unrecognised value is false, so the default is always the unmodified
+// behaviour.
+func truthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // decisionSummary renders the ranking compactly enough for a header.
@@ -231,7 +345,11 @@ func (s *Server) chatCompletion(w http.ResponseWriter, r *http.Request, p *gatew
 		return
 	}
 
+	s.observeCacheOutcome(p)
+	setCacheHeaders(w, p)
+
 	p.Price(&rec, resp.Usage)
+	rec.FinishReason = string(resp.FinishReason)
 	rec.Outcome = meter.OutcomeSuccess
 	rec.Duration = time.Since(start)
 
@@ -280,6 +398,20 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gat
 	}
 	defer stream.Close()
 
+	s.observeCacheOutcome(p)
+	setCacheHeaders(w, p)
+
+	// A cache hit knows its exact token counts before the first byte, which a
+	// live stream never does. Replacing the pre-flight estimate with the real
+	// figure — and clearing the flag that said it was one — is the whole reason
+	// this runs after the lookup and before the writer starts.
+	if p.CacheHit {
+		cached := p.NewRecord(true)
+		p.Price(&cached, p.CachedUsage)
+		w.Header().Del(HeaderSavedEstimated)
+		s.setSavingsHeaders(w, &cached, false)
+	}
+
 	s.streamsOpened()
 	defer s.streamsClosed()
 
@@ -327,6 +459,9 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gat
 		if firstToken.IsZero() && (chunk.Text != "" || chunk.ToolCall != nil) {
 			firstToken = time.Now()
 			rec.TTFT = firstToken.Sub(start)
+		}
+		if chunk.FinishReason != "" {
+			rec.FinishReason = string(chunk.FinishReason)
 		}
 
 		if err := sw.Send(wire.EncodeChunk(chunk, id, p.RequestedModel, created)); err != nil {
@@ -445,6 +580,33 @@ func (s *Server) logCompletion(r *http.Request, p *gateway.Prepared, rec meter.R
 		slog.Bool("substituted", rec.Substituted),
 		slog.Duration("duration", rec.Duration),
 		slog.Duration("overhead", rec.Overhead()),
+	}
+
+	if rec.CacheHit {
+		attrs = append(attrs, slog.Bool("cache_hit", true))
+	}
+	if len(p.Decision.Optimizations) > 0 {
+		// Reasons included here and nowhere else. The header has no room and the
+		// ledger keeps only lever names, so this is the record that answers
+		// "why is this answer shorter than yesterday's" months later.
+		for _, o := range p.Decision.Optimizations {
+			attrs = append(attrs, slog.Group("optimization",
+				slog.String("lever", o.Lever),
+				slog.String("before", o.Before),
+				slog.String("after", o.After),
+				slog.String("reason", o.Reason),
+			))
+		}
+		attrs = append(attrs, slog.Int("cache_breakpoints", rec.Breakpoints))
+	}
+	if p.Optimize.Degraded() {
+		// Fail-open is silent by construction. Saying so at warn level is the
+		// difference between "we stopped optimizing" and "nobody noticed".
+		s.log.LogAttrs(r.Context(), slog.LevelWarn, "optimizer degraded",
+			slog.String("request_id", rec.RequestID),
+			slog.String("outcome", string(p.Optimize.Outcome)),
+			slog.Duration("elapsed", p.Optimize.Elapsed),
+		)
 	}
 	if rec.SavingMeasured {
 		attrs = append(attrs,

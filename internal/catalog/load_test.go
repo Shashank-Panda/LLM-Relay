@@ -470,3 +470,75 @@ func TestLoadErrorFormatting(t *testing.T) {
 		t.Errorf("multi-problem error = %q", got)
 	}
 }
+
+// --- Phase 3: route response cache ---
+
+func TestRouteCacheDefaults(t *testing.T) {
+	cat := mustLoad(t, withRouteCache("cache:\n      enabled: true"))
+
+	rc := cat.Routes["r"].Cache
+	if !rc.Enabled {
+		t.Fatal("cache was not enabled")
+	}
+	// Zero is not unbounded. A cache with no expiry serves last month's answer
+	// to this month's question with no way to notice.
+	if got := rc.EffectiveTTL(); got != domain.DefaultCacheTTL {
+		t.Errorf("EffectiveTTL = %v, want %v", got, domain.DefaultCacheTTL)
+	}
+	if rc.AllowTemperature {
+		t.Error("allow_temperature defaulted to true; a caller who asked for variation " +
+			"must not silently get one answer forever")
+	}
+}
+
+func TestRouteCacheRejections(t *testing.T) {
+	tests := map[string]struct {
+		block string
+		want  string
+	}{
+		// An operator who wrote a TTL and no enabled:true believes caching is on.
+		// Accepting the file means they find out from a savings report months later.
+		"configured but off": {"cache:\n      ttl: 5m", "not enabled"},
+		"unparseable ttl":    {"cache:\n      enabled: true\n      ttl: 3600", "is not a duration"},
+		"negative ttl":       {"cache:\n      enabled: true\n      ttl: -5m", "must be positive"},
+		"absurd ttl":         {"cache:\n      enabled: true\n      ttl: 72h", "exceeds the"},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := load(t, withRouteCache(tc.block))
+			if err == nil {
+				t.Fatalf("loaded a catalog with %s", name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestUnknownCacheFieldIsRejected(t *testing.T) {
+	// Strict decoding, for the same reason the rest of the file has it: a typo
+	// in a cache setting that is silently ignored produces a cache whose
+	// behaviour is not what anybody believes it to be.
+	_, err := load(t, withRouteCache("cache:\n      enabled: true\n      tt1: 5m"))
+	if err == nil {
+		t.Fatal("a misspelled cache field was accepted")
+	}
+}
+
+func withRouteCache(block string) string {
+	return `
+version: "v1"
+endpoints:
+  - id: e1
+    provider: openai
+    model: m
+    limits: {context_window: 1000}
+routes:
+  - name: r
+    candidates: [e1]
+    weights: {cost: 1.0}
+    ` + block + `
+`
+}

@@ -18,7 +18,7 @@ A `model` value is one of three things:
 
 Precedence, in order:
 
-1. **`X-Relay-Pin: strict` wins over everything.** Served exactly as requested, no optimization, no substitution. Always honored.
+1. **`X-Relay-Pin: strict` wins over everything.** Served exactly as requested: no optimization, no response cache, no substitution. Always honored. Note that this is stronger than a tenant whose `optimization_mode` is `strict` — that setting forbids serving a *different model*, and leaves the request-level levers to `policy.levers` (see [§6](#6-request-optimization)). The pin header is the escape hatch for the one request where nothing may be touched, and an escape hatch with exceptions is not one.
 2. **An explicit real model** is a pin when optimization is off, and a **baseline + ceiling** when it is on.
 3. **Otherwise the named virtual model's route applies.**
 4. **Otherwise the tenant's default route applies.**

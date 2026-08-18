@@ -26,6 +26,7 @@ import (
 	"github.com/Shashank-Panda/relay/internal/provider/anthropic"
 	"github.com/Shashank-Panda/relay/internal/provider/ollama"
 	"github.com/Shashank-Panda/relay/internal/provider/openai"
+	"github.com/Shashank-Panda/relay/internal/respcache"
 	"github.com/Shashank-Panda/relay/internal/server"
 	"github.com/Shashank-Panda/relay/internal/tenant"
 )
@@ -36,6 +37,8 @@ type config struct {
 	catalogPath  string
 	tenantsPath  string
 	ledgerPath   string
+	cacheEntries int
+	cacheMB      int
 	maxPriceAge  time.Duration
 	logLevel     string
 	logFormat    string
@@ -62,6 +65,10 @@ func run() error {
 		"path to the tenant registry; a missing file means every request is anonymous")
 	flag.StringVar(&cfg.ledgerPath, "ledger", "data/ledger.jsonl",
 		"append-only savings ledger; empty disables durable metering")
+	flag.IntVar(&cfg.cacheEntries, "cache-entries", respcache.DefaultMaxEntries,
+		"exact-match response cache size in entries; 0 or less disables the cache")
+	flag.IntVar(&cfg.cacheMB, "cache-mb", respcache.DefaultMaxBytes>>20,
+		"exact-match response cache size in MiB")
 	flag.DurationVar(&cfg.maxPriceAge, "max-price-age", 90*24*time.Hour,
 		"reject pricing not verified within this window; 0 disables the check")
 	flag.StringVar(&cfg.logLevel, "log-level", "info", "debug | info | warn | error")
@@ -113,7 +120,13 @@ func run() error {
 	mx := metrics.New(promReg)
 
 	agg := meter.NewAggregator(time.Now().UTC())
-	sinks := []meter.Sink{agg, mx}
+
+	// RouteStats is a sink rather than a separate instrumentation point for the
+	// same reason Metrics is: the output-ceiling lever, the savings report, and
+	// the dashboards must all be describing the same requests, and the way to
+	// guarantee that is for all three to read the same Record.
+	stats := meter.NewRouteStats(meter.DefaultMinSamples)
+	sinks := []meter.Sink{agg, mx, stats}
 
 	if cfg.ledgerPath != "" {
 		ledger, err := meter.OpenFile(cfg.ledgerPath, 64)
@@ -125,10 +138,23 @@ func run() error {
 	}
 	mtr := meter.New(meter.DefaultBuffer, sinks...)
 
+	// Off entirely when sized to nothing, and off by route otherwise. Two gates,
+	// because "no route opted in" and "the operator disabled it" are different
+	// decisions made by different people.
+	var cache *respcache.Store
+	if cfg.cacheEntries > 0 {
+		cache = respcache.New(respcache.Options{
+			MaxEntries: cfg.cacheEntries,
+			MaxBytes:   cfg.cacheMB << 20,
+		})
+	}
+
 	gw := &gateway.Gateway{
 		Store:    store,
 		Executor: execute.New(registry, resolver),
 		Tenants:  tenants,
+		Stats:    stats,
+		Cache:    cache,
 		// The fallback when no tenant registry is configured. Strict: nobody
 		// gets substituted by leaving a file absent.
 		Policy: domain.DefaultPolicy(),
@@ -160,7 +186,7 @@ func run() error {
 	if cfg.adminAddr != "" {
 		adminSrv = &http.Server{
 			Addr:              cfg.adminAddr,
-			Handler:           server.NewAdmin(agg, mtr, promReg).Handler(),
+			Handler:           server.NewAdmin(agg, mtr, promReg).WithOptimizer(cache, stats).Handler(),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
 		go func() {
@@ -199,6 +225,7 @@ func run() error {
 			"providers", registry.Providers(),
 			"tenants", tenants.IDs(),
 			"ledger", orNone(cfg.ledgerPath),
+			"response_cache", cacheDescription(cache, cfg.cacheEntries, cfg.cacheMB),
 		)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errs <- err
@@ -247,6 +274,18 @@ func run() error {
 
 	log.Info("shutdown complete", "records_written", mtr.Written())
 	return nil
+}
+
+// cacheDescription renders the cache configuration for the startup line.
+//
+// Logged because a disabled response cache is indistinguishable at runtime from
+// an enabled one that nothing has opted into, and the first thing anybody asks
+// about a cache with no hits is which of the two it is.
+func cacheDescription(c *respcache.Store, entries, mb int) string {
+	if c == nil {
+		return "(disabled)"
+	}
+	return fmt.Sprintf("%d entries / %d MiB, per-route opt-in", entries, mb)
 }
 
 func orNone(s string) string {

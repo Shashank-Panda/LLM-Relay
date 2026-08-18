@@ -66,6 +66,17 @@ type Decision struct {
 	Ranked   []ScoredCandidate
 	Rejected []RejectedCandidate
 
+	// Optimizations lists every adjustment the optimizer made to the request,
+	// with before and after values.
+	//
+	// It lives on the Decision rather than beside it because the Decision is
+	// what gets disclosed, recorded, and replayed — and an optimization the
+	// customer cannot see is indistinguishable from a bug (ADR-0008). The
+	// router does not produce these; the pipeline fills them in between
+	// optimization and execution, which is the one field on this struct that
+	// Route itself never writes.
+	Optimizations []Optimization
+
 	// BaselineCost prices the same request against the baseline endpoint;
 	// EstimatedCost prices it against Chosen. Both are estimates — the ledger
 	// recomputes them from reported actuals once the response completes.

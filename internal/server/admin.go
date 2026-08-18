@@ -8,6 +8,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/Shashank-Panda/relay/internal/meter"
+	"github.com/Shashank-Panda/relay/internal/respcache"
 )
 
 // Admin serves metrics and the savings query.
@@ -27,10 +28,23 @@ type Admin struct {
 	agg      *meter.Aggregator
 	meter    *meter.Meter
 	registry *prometheus.Registry
+
+	// cache and stats are the two Phase 3 components whose state is otherwise
+	// invisible. Both answer the same operator question — "why is the optimizer
+	// not saving me anything" — which without them requires a debugger.
+	cache *respcache.Store
+	stats *meter.RouteStats
 }
 
 func NewAdmin(agg *meter.Aggregator, m *meter.Meter, reg *prometheus.Registry) *Admin {
 	return &Admin{agg: agg, meter: m, registry: reg}
+}
+
+// WithOptimizer attaches the response cache and the route-stats histogram.
+func (a *Admin) WithOptimizer(cache *respcache.Store, stats *meter.RouteStats) *Admin {
+	a.cache = cache
+	a.stats = stats
+	return a
 }
 
 func (a *Admin) Handler() http.Handler {
@@ -79,11 +93,35 @@ func (a *Admin) handleSavings(w http.ResponseWriter, r *http.Request) {
 		meter.Report
 		DroppedRecords uint64 `json:"dropped_records"`
 		Incomplete     bool   `json:"incomplete,omitempty"`
-		Scope          string `json:"scope"`
+
+		// CachedInputShare is the fraction of purchased input tokens the
+		// providers reported as cache reads.
+		//
+		// This is the number that says whether breakpoint insertion works.
+		// breakpoints_inserted in the totals above says only that markers were
+		// placed, and a marker in the wrong position is silently useless — the
+		// request succeeds, the bill is unchanged, and nothing anywhere reports
+		// a problem (ADR-0008).
+		CachedInputShare float64 `json:"cached_input_share"`
+
+		ResponseCache respcache.Stats `json:"response_cache"`
+		CacheHitRate  float64         `json:"response_cache_hit_rate"`
+
+		// RouteOutputP95 is the observed output length per route, and the reason
+		// it is exposed: the output-ceiling lever declines to act on a route
+		// without enough history, and an absent entry here is the whole
+		// explanation for a lever that appears to do nothing.
+		RouteOutputP95 map[string]int `json:"route_output_p95,omitempty"`
+
+		Scope string `json:"scope"`
 	}{
-		Report:         rep,
-		DroppedRecords: a.meter.Dropped(),
-		Incomplete:     a.meter.Dropped() > 0,
+		Report:           rep,
+		DroppedRecords:   a.meter.Dropped(),
+		Incomplete:       a.meter.Dropped() > 0,
+		CachedInputShare: rep.Overall.CachedInputShare(),
+		ResponseCache:    a.cache.Stats(),
+		CacheHitRate:     a.cache.Stats().HitRate(),
+		RouteOutputP95:   a.stats.Routes(),
 		// Stated so nobody reads a single instance's figures as a fleet total.
 		// The durable JSONL ledger is what makes the global number
 		// reconstructable until Phase 7's Postgres sink lands.

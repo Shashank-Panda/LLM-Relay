@@ -75,7 +75,7 @@ Every request resolves to a **baseline endpoint** — the thing the caller would
 
 | Mode | Behavior |
 |---|---|
-| `strict` | Serve the baseline. No optimization, no substitution. Set by `X-Relay-Pin: strict`, or by a tenant with optimization disabled. |
+| `strict` | Serve the baseline: no substitution. Set by `X-Relay-Pin: strict`, or by a tenant with optimization disabled. The header form additionally disables the Optimizer and the response cache; the tenant setting does not, because request-level levers change no model and are governed separately by `Policy.Levers`. |
 | `shadow` | Serve the baseline, but route and price the counterfactual anyway and record what *would* have been saved. |
 | `optimize` | Route freely below the baseline, subject to the quality floor. |
 

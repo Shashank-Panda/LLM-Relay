@@ -13,12 +13,45 @@ type Optimization struct {
 }
 
 // Lever names, used in Optimization.Lever and in the metrics label.
+//
+// A closed set, because it is a Prometheus label value. Anything derived from a
+// request would be unbounded cardinality.
 const (
 	LeverCacheBreakpoints = "cache_breakpoints"
 	LeverEffort           = "effort"
 	LeverMaxTokens        = "max_tokens"
 	LeverContextPrune     = "context_prune"
+
+	// LeverResponseCache is recorded when an answer was served from the
+	// exact-match response cache. It is not applied by the Optimizer — no
+	// request was rewritten — but it is an optimization the caller is entitled
+	// to see, and it belongs in the same list for the same reason.
+	LeverResponseCache = "response_cache"
 )
+
+// String renders one adjustment compactly enough for a response header.
+//
+// "lever=before>after". Terse because the medium is: a header is a bounded
+// space that proxies may truncate, and the full text with its reason belongs in
+// the ledger and in a dry-run response.
+func (o Optimization) String() string {
+	if o.Before == "" && o.After == "" {
+		return o.Lever
+	}
+	return o.Lever + "=" + o.Before + ">" + o.After
+}
+
+// LeverNames lists the levers applied, for the ledger and the metrics label.
+func LeverNames(ops []Optimization) []string {
+	if len(ops) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ops))
+	for _, o := range ops {
+		out = append(out, o.Lever)
+	}
+	return out
+}
 
 // LeverConfig selects which optimizations are enabled and bounds each one.
 //

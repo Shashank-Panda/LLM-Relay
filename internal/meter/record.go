@@ -65,6 +65,32 @@ type Record struct {
 	Substituted  bool `json:"substituted"`
 	UsedFallback bool `json:"used_fallback,omitempty"`
 
+	// Optimizations names the levers applied to this request. Names only; the
+	// before/after detail goes to the caller in headers and to the operator in
+	// the completion log. The ledger needs enough to answer "which levers are
+	// earning their keep", and a ledger line is not a place to put prose.
+	Optimizations []string `json:"optimizations,omitempty"`
+
+	// Breakpoints is how many cache markers were inserted.
+	//
+	// Recorded next to CachedInputTokens on purpose. A breakpoint in the wrong
+	// place is silently useless — the request succeeds, the cost is unchanged,
+	// and nothing anywhere reports a problem — so the inserted count is only
+	// meaningful when read against what the provider actually said it cached.
+	// See ADR-0008.
+	Breakpoints int `json:"breakpoints,omitempty"`
+
+	// CacheHit means this answer came from the exact-match response cache and
+	// no provider was called. Cost is therefore genuinely zero, which is the
+	// one place in this struct where a zero cost is a fact rather than a gap.
+	CacheHit bool `json:"cache_hit,omitempty"`
+
+	// FinishReason is why generation stopped. Carried for one specific reason:
+	// `length` on a request whose ceiling Relay set is the optimizer truncating
+	// somebody's answer, and a lever that does that regularly is misconfigured
+	// rather than working (ADR-0008).
+	FinishReason string `json:"finish_reason,omitempty"`
+
 	InputTokens       int  `json:"input_tokens"`
 	CachedInputTokens int  `json:"cached_input_tokens,omitempty"`
 	OutputTokens      int  `json:"output_tokens"`
@@ -136,11 +162,39 @@ func (r *Record) FromUsage(u provider.Usage) {
 // get subtly wrong: Saved must stay zero when unmeasured, and the shadow figure
 // must never leak into it.
 func (r *Record) Price(u provider.Usage, cat *domain.Catalog, d *domain.Decision) {
-	r.FromUsage(u)
+	r.price(u, cat, d, false)
+}
 
-	if served, ok := cat.Endpoint(d.Chosen); ok {
-		r.Cost = u.Cost(served)
+// PriceCacheHit prices a request answered from the response cache.
+//
+// Separate from Price rather than a boolean on it, because the arithmetic is
+// genuinely different and the difference is the entire claim: no provider was
+// called, so Cost is zero, and the saving is the *whole* baseline cost rather
+// than a difference between two prices. The usage passed in is the stored
+// usage from the original call — it is what the request would have consumed,
+// which is exactly what makes the counterfactual computable.
+//
+// The counterfactual is deliberately not computed here. In shadow mode the
+// shadow figure answers "what would substitution have saved", and nothing was
+// executed to substitute; reporting a substitution saving on a request that
+// made no call would be inventing one.
+func (r *Record) PriceCacheHit(u provider.Usage, cat *domain.Catalog, d *domain.Decision) {
+	r.price(u, cat, d, true)
+}
+
+func (r *Record) price(u provider.Usage, cat *domain.Catalog, d *domain.Decision, cacheHit bool) {
+	r.FromUsage(u)
+	r.CacheHit = cacheHit
+	r.Optimizations = domain.LeverNames(d.Optimizations)
+
+	if !cacheHit {
+		if served, ok := cat.Endpoint(d.Chosen); ok {
+			r.Cost = u.Cost(served)
+		}
 	}
+	// Cost stays zero on a cache hit. No tokens were bought, so the honest
+	// figure is zero — and it is what makes a response cache show up as a real
+	// measured saving in strict mode rather than as an unexplained gap.
 
 	r.SavingMeasured = d.SavingMeasured
 	if !d.SavingMeasured {
@@ -157,7 +211,7 @@ func (r *Record) Price(u provider.Usage, cat *domain.Catalog, d *domain.Decision
 	r.BaselineCost = u.Cost(base)
 	r.Saved = r.BaselineCost - r.Cost
 
-	if d.Counterfactual == "" {
+	if d.Counterfactual == "" || cacheHit {
 		return
 	}
 	// Shadow mode: the baseline was served, so Saved above is correctly zero.

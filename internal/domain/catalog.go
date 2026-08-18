@@ -5,6 +5,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Constraint is a route-level hard requirement. Constraints eliminate; weights
@@ -41,6 +42,48 @@ type Route struct {
 	// means fall back to the baseline instead.
 	Fallback    string
 	MaxAttempts int
+
+	// Cache configures the exact-match response cache for this route. Off by
+	// default: reusing a previous answer is a behaviour change, so it is opted
+	// into per route rather than inherited.
+	Cache RouteCache
+}
+
+// RouteCache is a route's exact-match response cache configuration.
+//
+// Off unless a route says otherwise, and even then bounded by two rules the
+// zero value gets right by accident and a careless config would get wrong on
+// purpose. See the correctness constraints in roadmap Phase 3.
+type RouteCache struct {
+	// Enabled opts this route in. Nothing is cached for a route that has not.
+	Enabled bool
+
+	// TTL bounds how long an answer may be reused. Zero means DefaultCacheTTL —
+	// never unbounded, because a cache with no expiry is a system that serves
+	// last month's answer to this month's question with no way to notice.
+	TTL time.Duration
+
+	// AllowTemperature permits caching requests with temperature > 0.
+	//
+	// Off by default and deliberately awkward to switch on. A caller who set a
+	// non-zero temperature asked for variation; returning the same answer every
+	// time is not a cheaper version of that request, it is a different one.
+	AllowTemperature bool
+}
+
+// DefaultCacheTTL applies to a route that enables caching without naming one.
+//
+// Fifteen minutes, chosen to be obviously short. The cache exists to collapse
+// bursts of identical requests — a retry storm, a dashboard polling the same
+// prompt, a test suite — not to act as a durable answer store.
+const DefaultCacheTTL = 15 * time.Minute
+
+// EffectiveTTL resolves the configured TTL against the default.
+func (c RouteCache) EffectiveTTL() time.Duration {
+	if c.TTL <= 0 {
+		return DefaultCacheTTL
+	}
+	return c.TTL
 }
 
 const weightSumTolerance = 1e-9

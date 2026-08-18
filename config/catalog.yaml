@@ -194,3 +194,15 @@ routes:
       latency: 0.20
     fallback: anthropic/claude-sonnet-5@us-east
     max_attempts: 3
+    # Exact-match response cache, opted into per route rather than globally,
+    # because whether replaying an answer is acceptable depends on what the
+    # route is for. This one answers questions about long documents that do not
+    # change between turns, which is where identical requests actually recur;
+    # a route summarising a live feed would leave this off.
+    #
+    # Entries are scoped to a tenant and to the endpoint that produced them, and
+    # are keyed on every field that affects the output. allow_temperature is
+    # absent, so a caller who asked for variation still gets a live call.
+    cache:
+      enabled: true
+      ttl: 15m

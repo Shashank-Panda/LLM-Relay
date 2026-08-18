@@ -31,6 +31,13 @@ type NormalizedRequest struct {
 	SessionKey       string
 	PreviousEndpoint string
 
+	// NoCache bypasses the response cache in both directions for this request.
+	//
+	// Both, deliberately. A bypass that still wrote to the cache would let a
+	// caller who asked for a fresh answer decide what every subsequent caller
+	// gets served, which is the opposite of what they asked for.
+	NoCache bool
+
 	Estimate Estimate
 	Metadata map[string]string
 }

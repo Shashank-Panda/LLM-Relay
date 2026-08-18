@@ -273,3 +273,133 @@ func TestIDsAreSorted(t *testing.T) {
 		}
 	}
 }
+
+// --- Phase 3: lever configuration ---
+
+// withLevers wraps a levers block in the smallest valid tenant file.
+func withLevers(block string) string {
+	return "tenants:\n  - id: t\n    policy:\n      levers:\n" + block
+}
+
+func leversOf(t *testing.T, block string) domain.LeverConfig {
+	t.Helper()
+	r, err := Load(strings.NewReader(withLevers(block)))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	tn, ok := r.ByID("t")
+	if !ok {
+		t.Fatal("tenant t is missing")
+	}
+	return tn.Policy.Levers
+}
+
+func TestNoLeverBlockEnablesNothing(t *testing.T) {
+	// The same posture as strict mode: a tenant must never discover their
+	// requests are being rewritten because a field was left blank.
+	r, err := Load(strings.NewReader("tenants:\n  - id: t\n    policy:\n      optimization_mode: shadow\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	tn, _ := r.ByID("t")
+	if tn.Policy.Levers != (domain.LeverConfig{}) {
+		t.Errorf("Levers = %+v, want the zero value", tn.Policy.Levers)
+	}
+}
+
+func TestRecommendedPreset(t *testing.T) {
+	got := leversOf(t, "        preset: recommended\n")
+
+	if got != domain.RecommendedLevers() {
+		t.Errorf("preset produced %+v, want %+v", got, domain.RecommendedLevers())
+	}
+	// The preset enables the two levers that do not change what the model is
+	// asked, and leaves the two that do switched off.
+	if got.ContextPruning || got.EffortDownshift {
+		t.Error("the recommended preset enabled a lever that changes request semantics")
+	}
+}
+
+func TestAFieldCanTurnAPresetLeverOff(t *testing.T) {
+	// The reason these fields are pointers. With a plain bool, false is
+	// indistinguishable from unset, and a tenant disabling one lever from a
+	// preset would silently keep it.
+	got := leversOf(t, "        preset: recommended\n        output_ceiling: false\n")
+
+	if got.OutputCeiling {
+		t.Error("output_ceiling: false did not override the preset")
+	}
+	if !got.CacheBreakpoints {
+		t.Error("overriding one lever switched off another")
+	}
+}
+
+func TestLeverRejections(t *testing.T) {
+	tests := map[string]struct {
+		block string
+		want  string
+	}{
+		"unknown preset": {"        preset: aggressive\n", "not one of recommended"},
+		// A lever that is on but unconfigured would silently never fire, which
+		// reads as "optimization is broken" rather than as "a field is missing".
+		"breakpoints unconfigured": {
+			"        cache_breakpoints: true\n", "needs max_breakpoints"},
+		"ceiling unconfigured": {
+			"        output_ceiling: true\n", "needs output_ceiling_slack"},
+		"effort without a default": {
+			"        effort_downshift: true\n", "needs default_effort"},
+		"pruning without a window": {
+			"        context_pruning: true\n", "needs keep_turns"},
+		// Below 1 the ceiling lands under the observed p95 and truncates most
+		// responses. Rejected rather than clamped: the operator meant something,
+		// and it was not this.
+		"slack below one": {
+			"        preset: recommended\n        output_ceiling_slack: 0.5\n", "at least 1"},
+		"unknown effort": {
+			"        effort_downshift: true\n        default_effort: maximum\n",
+			"not one of minimal"},
+		"negative bound": {
+			"        preset: recommended\n        max_breakpoints: -1\n", "must not be negative"},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(strings.NewReader(withLevers(tc.block)))
+			if err == nil {
+				t.Fatalf("loaded a file with %s", name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLeversAreIndependentOfMode(t *testing.T) {
+	// The distinction Phase 3 turns on: mode governs whether Relay may serve a
+	// different model, levers govern whether it may rewrite the request sent to
+	// the model that was asked for. A strict tenant can hold the first line and
+	// still take the savings from the second.
+	r, err := Load(strings.NewReader(
+		"tenants:\n  - id: t\n    policy:\n      optimization_mode: strict\n" +
+			"      levers:\n        preset: recommended\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	tn, _ := r.ByID("t")
+
+	if tn.Policy.OptimizationMode != domain.ModeStrict {
+		t.Errorf("mode = %q, want strict", tn.Policy.OptimizationMode)
+	}
+	if !tn.Policy.Levers.CacheBreakpoints {
+		t.Error("a strict-mode tenant could not enable a request-level lever")
+	}
+}
+
+func TestUnknownLeverFieldIsRejected(t *testing.T) {
+	// Strict decoding: a typo in a file that governs how requests are rewritten
+	// must not be silently ignored.
+	if _, err := Load(strings.NewReader(withLevers("        cache_breakpoint: true\n"))); err == nil {
+		t.Fatal("a misspelled lever field was accepted")
+	}
+}

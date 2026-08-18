@@ -13,7 +13,10 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/Shashank-Panda/relay/internal/domain"
 	"github.com/Shashank-Panda/relay/internal/meter"
+	"github.com/Shashank-Panda/relay/internal/optimize"
+	"github.com/Shashank-Panda/relay/internal/provider"
 )
 
 const namespace = "relay"
@@ -55,6 +58,34 @@ type Metrics struct {
 	// UsageEstimated counts requests whose provider reported no usage block.
 	// Their cost is a guess and this is how much of the total is guessed.
 	UsageEstimated *prometheus.CounterVec
+
+	// Optimizations counts each lever's firings, and BreakpointsInserted the
+	// cache markers placed.
+	//
+	// BreakpointsInserted must never be read on its own. A breakpoint in the
+	// wrong place is silently useless, so the only evidence the lever works is
+	// relay_tokens_total{kind="cached_input"} rising alongside it (ADR-0008).
+	Optimizations       *prometheus.CounterVec
+	BreakpointsInserted prometheus.Counter
+
+	// OptimizeDuration is the optimizer's own latency, against its 3 ms budget.
+	OptimizeDuration prometheus.Histogram
+
+	// CacheHits and CacheMisses cover the exact-match response cache.
+	CacheHits   *prometheus.CounterVec
+	CacheMisses *prometheus.CounterVec
+
+	// Truncated counts responses stopped by an output ceiling, labelled by who
+	// set it. A ceiling Relay set that fires regularly is wrong and should be
+	// raised — which is only actionable if the two sources are distinguishable.
+	Truncated *prometheus.CounterVec
+
+	// Degraded counts every fail-open path taken.
+	//
+	// Passthrough is silent by design, which is exactly why this has to exist:
+	// without it the gateway can stop optimizing entirely and go on looking
+	// perfectly healthy (ADR-0010).
+	Degraded *prometheus.CounterVec
 
 	MeterDropped  prometheus.Counter
 	StreamsActive prometheus.Gauge
@@ -137,6 +168,46 @@ func New(reg prometheus.Registerer) *Metrics {
 			Help: "Requests whose provider reported no usage block, so their cost is estimated.",
 		}, []string{"endpoint"}),
 
+		Optimizations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "optimizations_total",
+			Help: "Request optimizations applied, by lever.",
+		}, []string{"tenant", "lever"}),
+
+		BreakpointsInserted: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "cache_breakpoints_inserted_total",
+			Help: "Cache markers placed. Effort, not effect: read against " +
+				"relay_tokens_total{kind=\"cached_input\"}, never on its own.",
+		}),
+
+		OptimizeDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: namespace, Name: "optimize_duration_seconds",
+			Help: "Time spent in the optimizer, against its 3ms budget.",
+			// Centred on the budget rather than on web-request latencies: the
+			// interesting question is how close to 3ms the p99 runs.
+			Buckets: []float64{.00001, .000025, .00005, .0001, .00025, .0005, .001, .003, .01},
+		}),
+
+		CacheHits: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "cache_hits_total",
+			Help: "Responses served from the exact-match response cache.",
+		}, []string{"tenant", "route"}),
+
+		CacheMisses: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "cache_misses_total",
+			Help: "Cacheable requests with no live entry.",
+		}, []string{"tenant", "route"}),
+
+		Truncated: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "output_truncated_total",
+			Help: "Responses that stopped at an output ceiling, by who set the ceiling.",
+		}, []string{"endpoint", "ceiling"}),
+
+		Degraded: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "degraded_total",
+			Help: "Fail-open paths taken. Non-zero means part of Relay is not working " +
+				"and nothing else will say so.",
+		}, []string{"component", "reason"}),
+
 		MeterDropped: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace, Name: "meter_dropped_total",
 			Help: "Ledger records lost to a full buffer. Non-zero means the savings report is incomplete.",
@@ -153,6 +224,8 @@ func New(reg prometheus.Registerer) *Metrics {
 			m.Requests, m.Duration, m.Overhead, m.TTFT, m.Tokens,
 			m.Cost, m.BaselineCost, m.Saved, m.ShadowSaved,
 			m.Substitutions, m.Unmeasured, m.UsageEstimated,
+			m.Optimizations, m.BreakpointsInserted, m.OptimizeDuration,
+			m.CacheHits, m.CacheMisses, m.Truncated, m.Degraded,
 			m.MeterDropped, m.StreamsActive,
 		)
 	}
@@ -179,13 +252,32 @@ func (m *Metrics) Write(r meter.Record) {
 		m.TTFT.WithLabelValues(r.Endpoint).Observe(r.TTFT.Seconds())
 	}
 
-	m.Tokens.WithLabelValues(r.Endpoint, "input").Add(float64(r.InputTokens))
-	m.Tokens.WithLabelValues(r.Endpoint, "output").Add(float64(r.OutputTokens))
-	if r.CachedInputTokens > 0 {
-		m.Tokens.WithLabelValues(r.Endpoint, "cached_input").Add(float64(r.CachedInputTokens))
+	// Tokens counts what providers reported billing for. A cache hit bought
+	// none, so adding its counts here would inflate every per-token figure
+	// derived from this counter — including the one that says whether cache
+	// breakpoints are working.
+	if !r.CacheHit {
+		m.Tokens.WithLabelValues(r.Endpoint, "input").Add(float64(r.InputTokens))
+		m.Tokens.WithLabelValues(r.Endpoint, "output").Add(float64(r.OutputTokens))
+		if r.CachedInputTokens > 0 {
+			m.Tokens.WithLabelValues(r.Endpoint, "cached_input").Add(float64(r.CachedInputTokens))
+		}
+		if r.ReasoningTokens > 0 {
+			m.Tokens.WithLabelValues(r.Endpoint, "reasoning").Add(float64(r.ReasoningTokens))
+		}
 	}
-	if r.ReasoningTokens > 0 {
-		m.Tokens.WithLabelValues(r.Endpoint, "reasoning").Add(float64(r.ReasoningTokens))
+
+	for _, lever := range r.Optimizations {
+		m.Optimizations.WithLabelValues(r.Tenant, lever).Inc()
+	}
+	if r.Breakpoints > 0 {
+		m.BreakpointsInserted.Add(float64(r.Breakpoints))
+	}
+	if r.CacheHit {
+		m.CacheHits.WithLabelValues(r.Tenant, route).Inc()
+	}
+	if r.FinishReason == string(provider.FinishLength) {
+		m.Truncated.WithLabelValues(r.Endpoint, ceilingSource(r)).Inc()
 	}
 
 	m.Cost.WithLabelValues(r.Tenant, r.Endpoint).Add(r.Cost.Dollars())
@@ -231,6 +323,46 @@ func (m *Metrics) ObserveDropped(total uint64) {
 	if total > prev {
 		m.MeterDropped.Add(float64(total - prev))
 	}
+}
+
+// ObserveOptimize records one optimization pass, including the ones that did
+// nothing.
+//
+// Duration is recorded even for a pass with no levers enabled, because the
+// question the histogram answers is "what does the optimizer cost us", and a
+// sample set drawn only from passes that did work would answer a different one.
+func (m *Metrics) ObserveOptimize(res optimize.Result) {
+	if m == nil {
+		return
+	}
+	m.OptimizeDuration.Observe(res.Elapsed.Seconds())
+	if res.Degraded() {
+		m.Degraded.WithLabelValues("optimizer", string(res.Outcome)).Inc()
+	}
+}
+
+// ObserveCacheMiss records a cacheable request that found no entry. Hits are
+// recorded from the ledger record, where the tenant and route are already known.
+func (m *Metrics) ObserveCacheMiss(tenant, route string) {
+	if m == nil {
+		return
+	}
+	m.CacheMisses.WithLabelValues(tenant, or(route, "none")).Inc()
+}
+
+// ceilingSource attributes a truncation to whoever set the ceiling.
+//
+// The distinction is the whole reason the metric exists. A caller's own
+// max_tokens firing is the caller getting what they asked for; Relay's ceiling
+// firing is Relay cutting off an answer somebody wanted, and only the second one
+// is a bug.
+func ceilingSource(r meter.Record) string {
+	for _, lever := range r.Optimizations {
+		if lever == domain.LeverMaxTokens {
+			return "relay"
+		}
+	}
+	return "caller"
 }
 
 func or(s, fallback string) string {

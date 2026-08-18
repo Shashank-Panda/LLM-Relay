@@ -387,6 +387,7 @@ func convertRoute(r routeYAML, path string, c *collector) *domain.Route {
 		Weights:     copyFloats(r.Weights),
 		Fallback:    r.Fallback,
 		MaxAttempts: r.MaxAttempts,
+		Cache:       convertRouteCache(r.Cache, path, c),
 	}
 	if rt.MaxAttempts == 0 {
 		rt.MaxAttempts = 1
@@ -400,6 +401,45 @@ func convertRoute(r routeYAML, path string, c *collector) *domain.Route {
 
 	return rt
 }
+
+// convertRouteCache validates one route's cache block.
+//
+// Settings on a disabled cache are rejected rather than ignored. An operator who
+// wrote a TTL and no `enabled: true` believes caching is on; silently accepting
+// the file means they find out it is not from a savings report months later.
+func convertRouteCache(y routeCacheYAML, path string, c *collector) domain.RouteCache {
+	out := domain.RouteCache{Enabled: y.Enabled, AllowTemperature: y.AllowTemperature}
+
+	if !y.Enabled && (y.TTL != "" || y.AllowTemperature) {
+		c.add(path+".cache", "configured but not enabled; set enabled: true or remove the block")
+		return domain.RouteCache{}
+	}
+	if y.TTL == "" {
+		return out
+	}
+
+	ttl, err := time.ParseDuration(y.TTL)
+	switch {
+	case err != nil:
+		c.add(path+".cache.ttl", "%q is not a duration such as \"5m\" or \"1h\"", y.TTL)
+	case ttl <= 0:
+		c.add(path+".cache.ttl", "must be positive; omit it to use the %s default",
+			domain.DefaultCacheTTL)
+	case ttl > maxCacheTTL:
+		// A day-long response cache is almost always a mistake, and the mistake
+		// is invisible: everything works and some answers are stale. Making it
+		// an error means the operator who genuinely wants it has to say so by
+		// changing this constant, in a review.
+		c.add(path+".cache.ttl", "%s exceeds the %s maximum; an answer older than that "+
+			"should be re-generated rather than replayed", ttl, maxCacheTTL)
+	default:
+		out.TTL = ttl
+	}
+	return out
+}
+
+// maxCacheTTL bounds how stale a replayed answer may be.
+const maxCacheTTL = 24 * time.Hour
 
 // knownCapabilities is the closed set a route may require. An unrecognised name
 // is an error rather than a no-op: a typo in a constraint must not silently

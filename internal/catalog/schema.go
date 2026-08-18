@@ -89,6 +89,26 @@ type routeYAML struct {
 	Weights     map[string]float64 `yaml:"weights"`
 	Fallback    string             `yaml:"fallback"`
 	MaxAttempts int                `yaml:"max_attempts"`
+	Cache       routeCacheYAML     `yaml:"cache"`
+}
+
+// routeCacheYAML configures the exact-match response cache for one route.
+//
+// Route-scoped rather than global because whether reusing an answer is
+// acceptable is a property of what the route is for. A route serving
+// documentation lookups can cache for an hour; a route summarising a live feed
+// cannot cache at all, and no global setting can tell them apart.
+type routeCacheYAML struct {
+	Enabled bool `yaml:"enabled"`
+
+	// TTL is a Go duration string: "5m", "1h". Quoted as a duration rather than
+	// a number of seconds because an operator reading `ttl: 3600` has to stop
+	// and work out what unit somebody meant.
+	TTL string `yaml:"ttl"`
+
+	// AllowTemperature permits caching requests that asked for variation. The
+	// field name is deliberately long: it should be uncomfortable to set.
+	AllowTemperature bool `yaml:"allow_temperature"`
 }
 
 // constraintYAML is deliberately structured rather than an expression string.

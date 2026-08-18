@@ -8,15 +8,18 @@
 // question — which is why these levers work in strict mode, why a cautious
 // customer accepts them first, and why they ship before routing does.
 //
-// Apply is pure and deterministic: same request, same config, same stats, same
-// output. It performs no I/O and reads no clock. It is separate from the router
-// because it answers a different question — the optimizer transforms the
-// request, the router selects the endpoint.
+// Apply is deterministic in its levers: same request, same config, same stats,
+// same adjustments. It performs no I/O. It reads a clock for exactly one
+// purpose — enforcing its own latency budget — and that is why the budget is
+// injectable rather than implicit. It is separate from the router because it
+// answers a different question: the optimizer transforms the request, the router
+// selects the endpoint.
 package optimize
 
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/Shashank-Panda/relay/internal/domain"
 )
@@ -29,11 +32,24 @@ import (
 // requests route to endpoints they cannot actually fit in.
 const assumedMaxOutput = 4096
 
-// Stats is a snapshot of observed per-route behaviour.
+// StatsSource answers the one question the levers ask about history.
 //
-// A snapshot, not a query. The optimizer must not perform I/O, for the same
-// reason the router must not: it sits on the hot path inside a 3 ms budget, and
-// a component that reads a database cannot be table-tested.
+// An interface rather than the concrete Stats because the production
+// implementation is a live histogram maintained off the metering pipeline
+// (meter.RouteStats), and building a map snapshot per request purely to satisfy
+// a struct field would allocate on the hot path for nothing. Implementations
+// must be safe for concurrent reads and must not block: a lever that waits on a
+// lock has spent its budget on bookkeeping.
+type StatsSource interface {
+	// OutputP95 returns the 95th percentile of output lengths observed on this
+	// route, and false when there is no sound basis for one. False must mean
+	// "no basis", never "zero" — a lever that treats absent history as a small
+	// number would cap every route it has never seen.
+	OutputP95(route string) (int, bool)
+}
+
+// Stats is a fixed snapshot of observed per-route behaviour, for tests and for
+// callers that already hold the numbers.
 type Stats struct {
 	// OutputTokensP95 maps a route name to the 95th percentile of the output
 	// lengths it has actually produced.
@@ -53,50 +69,209 @@ func (s *Stats) OutputP95(route string) (int, bool) {
 	return v, true
 }
 
-type Optimizer struct {
-	cfg domain.LeverConfig
+// outputP95 reads a StatsSource that may be absent.
+//
+// A nil *Stats is safe to call; a nil interface is not, and the two are
+// different values that arrive from different places — nil *Stats from a test,
+// a nil interface from a gateway with no stats configured. Checking here means
+// no lever has to.
+func outputP95(s StatsSource, route string) (int, bool) {
+	if s == nil {
+		return 0, false
+	}
+	return s.OutputP95(route)
 }
 
-func New(cfg domain.LeverConfig) *Optimizer { return &Optimizer{cfg: cfg} }
+// DefaultBudget is the latency the optimizer is allowed to spend.
+//
+// Three milliseconds, from ADR-0008. It is a p99 target for the whole
+// component against a 5 ms p50 gateway overhead SLO, which means the budget is
+// not decoration: a lever that overruns it is spending the customer's latency
+// to save the customer's money, and past this point that trade stops being
+// worth making.
+const DefaultBudget = 3 * time.Millisecond
+
+// Outcome is how an optimization pass ended. Recorded rather than inferred,
+// because passthrough is silent by design — without this a gateway can be
+// optimizing nothing at all and still look perfectly healthy.
+type Outcome string
+
+const (
+	// OutcomeApplied means every enabled lever ran to completion.
+	OutcomeApplied Outcome = "applied"
+
+	// OutcomeOverBudget means the budget was exhausted partway through. The
+	// levers that had already run are kept — each one is independently valid,
+	// and discarding correct work to reach a tidier state would cost the
+	// customer money for nothing.
+	OutcomeOverBudget Outcome = "over_budget"
+
+	// OutcomePanicked means a lever crashed and the original request was served
+	// untouched. Optimization is optional and inference is not (ADR-0010).
+	OutcomePanicked Outcome = "panicked"
+)
+
+// Result is one optimization pass.
+type Result struct {
+	// Request is the request to execute. Never nil when the input was non-nil:
+	// on every failure path it is the original.
+	Request *domain.NormalizedRequest
+
+	Applied []domain.Optimization
+	Outcome Outcome
+	Elapsed time.Duration
+}
+
+// Degraded reports whether this pass failed open. Distinct from "applied
+// nothing", which is the correct and silent outcome of a tenant with no levers
+// enabled.
+func (r Result) Degraded() bool {
+	return r.Outcome == OutcomeOverBudget || r.Outcome == OutcomePanicked
+}
+
+type Optimizer struct {
+	cfg domain.LeverConfig
+
+	// budget bounds the whole pass. Zero disables the check, which is what the
+	// determinism tests want: with no clock consulted, Apply is a pure function
+	// of its arguments.
+	budget time.Duration
+
+	// now is injected so the budget can be tested without sleeping. A test that
+	// proves a 3 ms budget by taking 3 ms is a test nobody runs on every commit.
+	now func() time.Time
+}
+
+func New(cfg domain.LeverConfig) *Optimizer {
+	return &Optimizer{cfg: cfg, budget: DefaultBudget, now: time.Now}
+}
+
+// WithBudget overrides the latency budget. Zero disables the check entirely.
+func (o *Optimizer) WithBudget(d time.Duration) *Optimizer {
+	c := *o
+	c.budget = d
+	return &c
+}
+
+// WithClock replaces the clock, for tests that need to drive the budget.
+func (o *Optimizer) WithClock(now func() time.Time) *Optimizer {
+	c := *o
+	c.now = now
+	return &c
+}
 
 // Apply returns an optimized copy of req and the list of adjustments made.
+//
+// Retained as the two-value form because it is what reads well in tests and at
+// call sites that do not care how the pass ended. Anything that reports on the
+// optimizer — metrics, degradation alerts, dry-run — wants Run instead.
+func (o *Optimizer) Apply(req *domain.NormalizedRequest, stats StatsSource) (*domain.NormalizedRequest, []domain.Optimization) {
+	r := o.Run(req, stats)
+	return r.Request, r.Applied
+}
+
+// Run applies every enabled lever within the budget and reports how it went.
 //
 // The input is never mutated. The original must survive for retries, failover,
 // and the baseline cost comparison — and an optimizer that edited in place
 // would make "what did the caller actually send" unanswerable after the fact.
 //
-// It recovers from panics and returns the request untouched. That is not
-// defensive habit: optimization is optional and inference is not, so a bug in
-// this package must degrade to an unoptimized request rather than to a failed
-// one. See ADR-0010.
-func (o *Optimizer) Apply(req *domain.NormalizedRequest, stats *Stats) (out *domain.NormalizedRequest, applied []domain.Optimization) {
+// Two fail-open paths, for the same reason: optimization is optional and
+// inference is not, so a defect here must degrade to an unoptimized request
+// rather than to a failed one (ADR-0010).
+//
+//   - A panic in any lever abandons the whole pass and serves the original.
+//     Nothing partially applied escapes, because a request half-rewritten by a
+//     crashing lever is not a request anybody reasoned about.
+//   - Exhausting the budget stops the remaining levers and keeps what already
+//     ran. Each lever is independently valid and independently recorded, so
+//     there is nothing to unwind — and throwing away correct work to reach a
+//     tidier state would cost the customer money to no end.
+func (o *Optimizer) Run(req *domain.NormalizedRequest, stats StatsSource) (res Result) {
 	if req == nil {
-		return nil, nil
+		return Result{Outcome: OutcomeApplied}
 	}
+
+	start := o.clock()
 
 	defer func() {
 		if r := recover(); r != nil {
-			out, applied = req, nil
+			// Deliberately swallowed rather than re-raised. There is no useful
+			// place to report it from here — the optimizer has no logger by
+			// design, because a component inside a 3 ms budget should not be
+			// formatting strings — and the OutcomePanicked counter is what makes
+			// the failure visible.
+			res = Result{
+				Request: req,
+				Outcome: OutcomePanicked,
+				Elapsed: o.since(start),
+			}
 		}
 	}()
 
-	out = req.Clone()
+	out := req.Clone()
+	res = Result{Request: out, Outcome: OutcomeApplied}
 
 	// Order matters. Pruning changes the message list, so breakpoints must be
 	// placed against the final content or they would mark parts that are no
 	// longer there.
-	add := func(op *domain.Optimization) {
-		if op != nil {
-			applied = append(applied, *op)
+	levers := []func() *domain.Optimization{
+		func() *domain.Optimization { return o.pruneContext(out) },
+		func() *domain.Optimization { return o.placeCacheBreakpoints(out) },
+		func() *domain.Optimization { return o.applyDefaultEffort(out) },
+		func() *domain.Optimization { return o.applyOutputCeiling(out, stats) },
+	}
+
+	for _, lever := range levers {
+		if o.exhausted(start) {
+			res.Outcome = OutcomeOverBudget
+			break
+		}
+		if op := lever(); op != nil {
+			res.Applied = append(res.Applied, *op)
 		}
 	}
-	add(o.pruneContext(out))
-	add(o.placeCacheBreakpoints(out))
-	add(o.applyDefaultEffort(out))
-	add(o.applyOutputCeiling(out, stats))
 
+	// Always recomputed, including on the over-budget path. The estimate feeds
+	// the router's context-window filter and its cost model; leaving it stale
+	// after a lever has changed the request would route against a request that
+	// no longer exists, which is a correctness bug rather than a lost saving.
 	o.recomputeEstimate(out, stats)
-	return out, applied
+
+	res.Elapsed = o.since(start)
+	return res
+}
+
+// clock reads the injected clock, or nothing at all when the budget is off.
+//
+// Skipping the read is what keeps Apply a pure function under a zero budget:
+// there is no point consulting a clock whose answer cannot change the outcome,
+// and two calls to time.Now are two syscall-ish reads on the hot path.
+func (o *Optimizer) clock() time.Time {
+	if o.budget <= 0 || o.now == nil {
+		return time.Time{}
+	}
+	return o.now()
+}
+
+func (o *Optimizer) since(start time.Time) time.Duration {
+	if start.IsZero() || o.now == nil {
+		return 0
+	}
+	return o.now().Sub(start)
+}
+
+// exhausted reports whether the budget is spent.
+//
+// Checked between levers rather than inside them. A lever is a bounded walk
+// over a request that is already in memory, so the granularity is fine; the
+// alternative is threading a deadline through every helper to interrupt work
+// that was going to finish in microseconds anyway.
+func (o *Optimizer) exhausted(start time.Time) bool {
+	if o.budget <= 0 || start.IsZero() {
+		return false
+	}
+	return o.now().Sub(start) >= o.budget
 }
 
 // recomputeEstimate refreshes the token estimate after the levers have run.
@@ -105,7 +280,7 @@ func (o *Optimizer) Apply(req *domain.NormalizedRequest, stats *Stats) (out *dom
 // output ceiling changes the worst case, and both feed the router's
 // context-window filter and its cost estimate. Stale numbers here would route
 // against a request that no longer exists.
-func (o *Optimizer) recomputeEstimate(req *domain.NormalizedRequest, stats *Stats) {
+func (o *Optimizer) recomputeEstimate(req *domain.NormalizedRequest, stats StatsSource) {
 	req.Estimate.InputTokens = req.InputTokens()
 
 	maxOut := assumedMaxOutput
@@ -120,7 +295,7 @@ func (o *Optimizer) recomputeEstimate(req *domain.NormalizedRequest, stats *Stat
 	// the ceiling. Using the ceiling would price every request as its worst
 	// case and systematically over-estimate the cost of cheap endpoints.
 	expected := maxOut
-	if p95, ok := stats.OutputP95(req.RouteName); ok && p95 < expected {
+	if p95, ok := outputP95(stats, req.RouteName); ok && p95 < expected {
 		expected = p95
 	}
 	req.Estimate.ExpectedOutputTokens = expected
@@ -163,14 +338,14 @@ func (o *Optimizer) applyDefaultEffort(req *domain.NormalizedRequest) *domain.Op
 // nominal max_tokens of 64000 makes every request fail the context-window check
 // on smaller, cheaper endpoints, so an untouched ceiling quietly forces routing
 // onto expensive large-context models for requests that produce 300 tokens.
-func (o *Optimizer) applyOutputCeiling(req *domain.NormalizedRequest, stats *Stats) *domain.Optimization {
+func (o *Optimizer) applyOutputCeiling(req *domain.NormalizedRequest, stats StatsSource) *domain.Optimization {
 	if !o.cfg.OutputCeiling {
 		return nil
 	}
 	if req.Params.MaxTokens != nil {
 		return nil // the caller decided
 	}
-	p95, ok := stats.OutputP95(req.RouteName)
+	p95, ok := outputP95(stats, req.RouteName)
 	if !ok {
 		return nil // no history is no basis
 	}

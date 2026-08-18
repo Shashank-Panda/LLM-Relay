@@ -45,6 +45,14 @@ tenants:
       # survive, so a weight cannot express "never below this". See ADR-0009.
       quality_floor:
         coding: 0.60
+      # Levers are separate from optimization_mode, and the separation matters.
+      # Mode governs whether Relay may serve a *different model*; levers govern
+      # whether it may rewrite the request sent to the model that was asked for.
+      # Nothing here changes what the model is asked, so these apply in shadow
+      # mode and produce a real saving while the substitution figure is still a
+      # counterfactual.
+      levers:
+        preset: recommended
 
   # A customer who has not opted into anything. Everything is served exactly as
   # requested and the ledger still records what it cost.
@@ -55,4 +63,27 @@ tenants:
     keys:
       - 253c95211cd4ba54e4c7062e4d6fd5f23068c828cef4269dfdbc413d9b079539
     policy:
+      # Strict: never served a model they did not name. They still take the
+      # savings that carry no quality trade, which is the whole reason the
+      # levers ship before routing does — a cautious buyer gets a real benefit
+      # without granting permission to substitute anything.
+      #
+      # X-Relay-Pin: strict on an individual request is stronger still and turns
+      # these off too, along with the response cache. An escape hatch with
+      # exceptions is not one.
       optimization_mode: strict
+      levers:
+        cache_breakpoints: true
+        min_cacheable_tokens: 1024
+        max_breakpoints: 4
+        # Bounds an unbounded max_tokens toward this route's own observed p95.
+        # It never lowers a ceiling the caller set, and it declines entirely
+        # until the route has enough history to have a p95 worth trusting.
+        output_ceiling: true
+        output_ceiling_slack: 1.5
+        min_output_ceiling: 512
+        max_output_ceiling: 16384
+        # The two that change what the model is asked stay off. Context pruning
+        # deletes history; effort downshift overrides a provider default the
+        # caller may be relying on. Both are opt-in on their own terms.
+        context_pruning: false

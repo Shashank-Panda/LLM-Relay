@@ -98,7 +98,7 @@ Two known sources of drift to check when doing it: requests whose provider retur
 
 ---
 
-## Phase 3 — Optimizer and caching
+## Phase 3 — Optimizer and caching — **built, pending live provider validation**
 
 **Goal: real savings, with zero quality risk, still without substituting any models.**
 
@@ -116,7 +116,37 @@ Two known sources of drift to check when doing it: requests whose provider retur
 
 **Why before routing.** These savings work in `strict` mode, carry no quality-floor risk, and require no trust from the customer. A cautious buyer takes them first.
 
+**What "strict mode" means here, because two documents said different things.** [Routing §1](routing.md#1-the-routing-contract) says a strict request gets "no optimization"; [ADR-0008](adr/0008-request-optimization.md) says the levers work in `strict` mode and that shipping them first is the point. Both are kept, by separating the two things that were being called strict:
+
+- **Tenant `optimization_mode: strict`** means *no substitution*. Relay never serves a model the tenant did not name. It does not forbid rewriting the request sent to the model they did name — and a tenant gets levers only by configuring `policy.levers`, whose zero value enables none, so nothing changes for an existing deployment.
+- **`X-Relay-Pin: strict` on a request** is the stronger statement: the one request where nothing may be touched. It disables the optimizer *and* the response cache. An escape hatch with exceptions is not one.
+
+**What it needed that was not on the list.** The `max_tokens` ceiling is specified as "never below what the caller's own responses have historically needed", and nothing was measuring that — so the lever was correct code that declined to act on every request it ever saw. `meter.RouteStats` is a per-route histogram of observed output lengths, fed from the same `Record` as the ledger and the metrics and exposed to the optimizer as a `StatsSource`. It requires 50 samples before reporting a p95; it rounds *up* to a bucket edge, because a ceiling that lands under the observations it came from truncates the responses it was meant to accommodate; it decays old traffic, so a route whose prompts get rewritten re-learns its shape; and it returns "no basis" rather than a number for a route whose answers exceed its largest bucket, which is precisely the route that must not be capped. `/savings` reports it per route, because an absent entry there is the entire explanation for a lever that appears to do nothing.
+
+**Where the response cache lives.** [Architecture §7](architecture.md#7-state) puts it in Redis, shared across replicas. Phase 3 builds the in-process path first, behind the same interface — the same sequencing as the Phase 2 ledger and for the same reason: the local implementation is what a single-instance deployment needs, and the shared one changes no call site when it arrives. The consequence is stated rather than hidden: behind N replicas the hit rate is roughly 1/N of what it could be.
+
 **Done when:** provider-reported cached input tokens rise measurably after enabling breakpoint insertion, and a tenant in `strict` mode shows a positive measured saving.
+
+**Verification status.** The second half is closed. A `strict`-mode tenant with `levers.preset: recommended` serves one request live and the identical repeat from cache, and `/savings` reports `saved_micros` equal to the full baseline cost with `shadow_saved_micros` at zero — a measured saving, not a counterfactual, for a customer who has granted no permission to substitute anything. Each cache correctness constraint has a test that fails when the rule is removed: cross-tenant isolation (twice, in the key and re-checked against the stored entry), the temperature rule, per-route opt-in, `X-Relay-No-Cache` in both directions, and the length-prefixed key encoding that keeps `("ab","c")` and `("a","bc")` apart. A cancelled stream stores nothing, because a partial answer in a cache looks complete to everyone who reads it afterwards.
+
+The **first** half needs a real provider, because it is a claim about a vendor's behaviour rather than about this code. Breakpoint placement is provider-specific in its *effects*: the markers are encoded correctly for Anthropic's `cache_control` and OpenAI caches automatically, but whether a given placement actually produces cache reads is only knowable by asking. To close it:
+
+```sh
+# Enable breakpoints for a tenant, send the same long prefix twice against a
+# real Anthropic key, then:
+curl -s localhost:9090/savings | jq '{
+  effort: .overall.breakpoints_inserted,
+  effect: .overall.cached_input_tokens,
+  share:  .cached_input_share
+}'
+# A run with effort above zero and effect at zero means the markers are in the
+# wrong place and the lever is doing nothing but paying for cache writes. The
+# report says so inline rather than leaving it to be inferred, because that
+# failure is otherwise completely silent — the request succeeds and the bill is
+# simply unchanged.
+```
+
+Two things to watch while doing it. `relay_output_truncated_total{ceiling="relay"}` should stay near zero: the output ceiling is the one lever here that can shorten a legitimately long answer, and a ceiling that fires regularly is wrong rather than working. And `relay_degraded_total{component="optimizer"}` should be zero — it counts the fail-open paths, and passthrough is silent by design, so without it the gateway can stop optimizing entirely and go on looking perfectly healthy.
 
 ---
 

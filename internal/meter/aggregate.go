@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Shashank-Panda/relay/internal/domain"
+	"github.com/Shashank-Panda/relay/internal/provider"
 )
 
 // Totals is an aggregate over some set of records.
@@ -44,6 +45,43 @@ type Totals struct {
 	ShadowMeasured int64        `json:"shadow_requests"`
 
 	Substitutions int64 `json:"substitutions"`
+
+	// BreakpointRequests counts requests that had cache markers inserted, and
+	// Breakpoints the markers themselves.
+	//
+	// These two exist to be read against CachedInputTokens and never on their
+	// own. A breakpoint in the wrong place is silently useless — the request
+	// succeeds, the bill is unchanged, and no error appears anywhere — so
+	// "markers inserted" is a measure of effort and "cached input tokens" is the
+	// only measure of effect. ADR-0008 is explicit about this, and it is the
+	// specific check that closes Phase 3.
+	BreakpointRequests int64 `json:"breakpoint_requests"`
+	Breakpoints        int64 `json:"breakpoints_inserted"`
+
+	// CacheHits counts answers served from the response cache, and
+	// CacheHitTokens the tokens that were therefore never bought.
+	//
+	// Kept out of the token sums above deliberately. InputTokens and
+	// OutputTokens answer "what did we buy"; adding tokens nobody paid for would
+	// make that question unanswerable and would inflate every per-token figure
+	// derived from it.
+	CacheHits      int64 `json:"cache_hits"`
+	CacheHitTokens int64 `json:"cache_hit_tokens_avoided"`
+
+	// Truncated counts responses that stopped because they hit an output
+	// ceiling. A ceiling that fires regularly is wrong and should be raised —
+	// which is only knowable if it is counted (ADR-0008).
+	Truncated int64 `json:"truncated_responses"`
+}
+
+// CachedInputShare is the fraction of input tokens the provider reported as
+// cache reads. This is the number that says whether breakpoint insertion is
+// working; the inserted count says only that it was attempted.
+func (t Totals) CachedInputShare() float64 {
+	if t.InputTokens <= 0 {
+		return 0
+	}
+	return float64(t.CachedInputTokens) / float64(t.InputTokens)
 }
 
 func (t *Totals) add(r Record) {
@@ -55,9 +93,24 @@ func (t *Totals) add(r Record) {
 		t.EstimatedUsage++
 	}
 
-	t.InputTokens += int64(r.InputTokens)
-	t.CachedInputTokens += int64(r.CachedInputTokens)
-	t.OutputTokens += int64(r.OutputTokens)
+	if r.Breakpoints > 0 {
+		t.BreakpointRequests++
+		t.Breakpoints += int64(r.Breakpoints)
+	}
+	if r.FinishReason == string(provider.FinishLength) {
+		t.Truncated++
+	}
+
+	if r.CacheHit {
+		// Tokens avoided rather than tokens bought. See the field comments: the
+		// two must not be added together, so they are not added together here.
+		t.CacheHits++
+		t.CacheHitTokens += int64(r.InputTokens + r.OutputTokens)
+	} else {
+		t.InputTokens += int64(r.InputTokens)
+		t.CachedInputTokens += int64(r.CachedInputTokens)
+		t.OutputTokens += int64(r.OutputTokens)
+	}
 	t.Cost += r.Cost
 
 	if r.Substituted {
@@ -219,6 +272,18 @@ func noteFor(t Totals) string {
 	case t.Unmeasured > 0:
 		return "unmeasured_requests had no baseline to price against and are excluded from " +
 			"every cost figure here. Unmeasured is not the same as a saving of zero."
+	case t.Breakpoints > 0 && t.CachedInputTokens == 0:
+		// The failure this phrasing exists to prevent: reading
+		// breakpoints_inserted as evidence of savings. Markers were placed and
+		// the provider reported reading none of them, which means they are in
+		// the wrong place and the lever is doing nothing but adding cache
+		// writes.
+		return "breakpoints_inserted is above zero while cached_input_tokens is zero: markers " +
+			"were placed and the provider cached none of them. Inserted is effort; " +
+			"cached_input_tokens is effect."
+	case t.CacheHits > 0:
+		return "cache_hit_tokens_avoided is not included in input_tokens or output_tokens; " +
+			"those count tokens actually purchased."
 	default:
 		return ""
 	}
