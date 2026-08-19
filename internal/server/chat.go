@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Shashank-Panda/relay/internal/admit"
 	"github.com/Shashank-Panda/relay/internal/domain"
 	"github.com/Shashank-Panda/relay/internal/execute"
 	"github.com/Shashank-Panda/relay/internal/gateway"
@@ -73,6 +74,33 @@ const (
 	// HeaderDryRun asks what Relay would do, without doing it. Answered with the
 	// full decision and the optimizations, and no provider is contacted.
 	HeaderDryRun = "X-Relay-Dry-Run"
+
+	// HeaderAttempts is how many provider calls this answer took, present only
+	// when it took more than one.
+	//
+	// Disclosed because a retried request is slower and dearer than a clean one,
+	// and a caller debugging their own latency should not have to guess whether
+	// the extra second was the model thinking or Relay recovering.
+	HeaderAttempts = "X-Relay-Attempts"
+
+	// HeaderRerouted marks a request the router re-decided mid-flight after a
+	// provider rejected its routing constraints.
+	HeaderRerouted = "X-Relay-Rerouted"
+
+	// HeaderFailover marks a request served by a different endpoint running the
+	// same model — a recovery, not a substitution. Kept apart from
+	// HeaderSubstituted because conflating them would report a region failover
+	// as a model downgrade.
+	HeaderFailover = "X-Relay-Failover"
+
+	// HeaderEscalated marks a request where a downgraded model produced invalid
+	// output and the baseline was retried (ADR-0009).
+	//
+	// Disclosed because the caller paid for two answers. It is also the honest
+	// counterpart to the savings header on the same response: X-Relay-Saved-Usd
+	// will be *negative* here, and a caller who sees the cost without the reason
+	// has been given half the story.
+	HeaderEscalated = "X-Relay-Escalated"
 )
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -99,6 +127,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	req.ID = RequestID(r.Context())
 
+	// Admission before routing, because shedding is only worth doing when it is
+	// cheaper than the work it avoids — and everything expensive about a
+	// request happens after this point. A fast 503 the caller can retry beats a
+	// slow 504 for work Relay already paid a provider to perform.
+	lease, shed := s.admit.Acquire(r.Context(), body.Stream)
+	if shed != admit.ReasonNone {
+		s.writeShed(w, shed)
+		return
+	}
+	defer lease.Release()
+
 	tn := tenantOf(r.Context(), s.tenants)
 
 	if truthy(r.Header.Get(HeaderNoCache)) {
@@ -112,6 +151,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	prepared, err := s.gw.Prepare(req, tn, body.Model, r.Header.Get(HeaderPin))
 	if err != nil {
 		s.writePrepareError(w, err)
+		return
+	}
+
+	// The per-endpoint gate needs the endpoint, so it cannot run with the
+	// global one. It is the gate that matters during a partial outage: without
+	// it, one slow provider absorbs every global slot and starves the endpoints
+	// that are still healthy.
+	if shed := s.admit.Endpoint(r.Context(), lease, prepared.Decision.Chosen); shed != admit.ReasonNone {
+		s.writeShed(w, shed)
 		return
 	}
 
@@ -240,12 +288,81 @@ func (s *Server) observeCacheOutcome(p *gateway.Prepared) {
 	s.metrics.ObserveCacheMiss(p.TenantID(), p.Decision.RouteName)
 }
 
-// setCacheHeaders corrects the pre-flight cache header once the answer's origin
-// is known. Safe on a stream because it runs before the first frame.
-func setCacheHeaders(w http.ResponseWriter, p *gateway.Prepared) {
+// setServedHeaders corrects the pre-flight disclosure once the answer's origin
+// is known.
+//
+// The headers have to be written before execution — on a stream they are fixed
+// the moment the first frame goes out, which is why the decision exists before
+// the response starts at all. But a retry or a failover can move the endpoint
+// after that, and a disclosure header naming the endpoint Relay *intended* to
+// use is worse than none: it is a wrong answer to "which model produced this",
+// stated with confidence.
+//
+// Safe on both paths because it runs after execution and before the first byte:
+// non-streaming has written nothing yet, and streaming has only opened the
+// upstream connection.
+func setServedHeaders(w http.ResponseWriter, p *gateway.Prepared) {
+	h := w.Header()
+
 	if p.CacheHit {
-		w.Header().Set(HeaderCache, "hit")
+		h.Set(HeaderCache, "hit")
 	}
+	if p.Decision.Chosen != "" {
+		h.Set(HeaderEndpoint, p.Decision.Chosen)
+	}
+	// Substitution is only acceptable because it is visible, and a failover
+	// across models is a substitution however it came about. A failover to
+	// another deployment of the *same* model is not one, and saying so would
+	// tell a caller they got a cheaper model when they got the one they asked
+	// for from a different region.
+	if p.SubstitutedModel() {
+		h.Set(HeaderSubstituted, "true")
+	} else {
+		h.Del(HeaderSubstituted)
+	}
+	if p.FailedOver() {
+		h.Set(HeaderFailover, "true")
+	}
+	// Re-rendered because Chosen may have moved: the summary written before
+	// execution names the endpoint Relay intended to use.
+	h.Set(HeaderDecision, decisionSummary(p.Decision))
+
+	if n := len(p.Attempts); n > 1 {
+		h.Set(HeaderAttempts, strconv.Itoa(n))
+	}
+	if p.Rerouted {
+		h.Set(HeaderRerouted, "true")
+	}
+	if e := p.Escalation; e != nil {
+		h.Set(HeaderEscalated, string(e.Reason))
+	}
+}
+
+// writeShed refuses a request the gateway has no capacity for.
+//
+// 503 with Retry-After, never 429. The distinction is not pedantry: 429 says
+// "you sent too much", which blames a caller who may have sent one request, and
+// SDK retry logic treats the two differently. This is Relay saying it is busy,
+// which is what 503 means.
+//
+// Nothing is recorded in the ledger. No provider was called, nothing was spent,
+// and a shed request in the savings report would dilute every per-request figure
+// with work that never happened.
+func (s *Server) writeShed(w http.ResponseWriter, reason admit.Reason) {
+	if reason == admit.ReasonCancelled {
+		// The caller left while queued. Writing a response to a closed
+		// connection is pointless, and counting it as a shed would make a burst
+		// of client cancellations look like Relay refusing work.
+		return
+	}
+	if s.metrics != nil {
+		s.metrics.Shed.WithLabelValues(string(reason)).Inc()
+	}
+	if d := s.admit.RetryAfter(); d > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(d.Seconds()+0.5)))
+	}
+	wire.WriteError(w, http.StatusServiceUnavailable,
+		"relay is at capacity; retry shortly", wire.TypeAPIError, string(provider.ClassRetrySame))
 }
 
 // truthy reads a boolean request header.
@@ -335,6 +452,7 @@ func (s *Server) chatCompletion(w http.ResponseWriter, r *http.Request, p *gatew
 	rec.ProviderDuration = time.Since(providerStart)
 
 	if err != nil {
+		p.RecordAttempts(&rec)
 		rec.Outcome = outcomeFor(err)
 		rec.ErrorClass = string(provider.ClassOf(err))
 		rec.Duration = time.Since(start)
@@ -346,8 +464,8 @@ func (s *Server) chatCompletion(w http.ResponseWriter, r *http.Request, p *gatew
 	}
 
 	s.observeCacheOutcome(p)
-	setCacheHeaders(w, p)
-
+	p.RecordAttempts(&rec)
+	setServedHeaders(w, p)
 	p.Price(&rec, resp.Usage)
 	rec.FinishReason = string(resp.FinishReason)
 	rec.Outcome = meter.OutcomeSuccess
@@ -384,6 +502,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gat
 	providerStart := time.Now()
 	stream, _, att, err := s.gw.Stream(r.Context(), p)
 	if err != nil {
+		p.RecordAttempts(&rec)
 		rec.ProviderDuration = time.Since(providerStart)
 		rec.Duration = time.Since(start)
 		rec.Outcome = outcomeFor(err)
@@ -399,7 +518,8 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gat
 	defer stream.Close()
 
 	s.observeCacheOutcome(p)
-	setCacheHeaders(w, p)
+	p.RecordAttempts(&rec)
+	setServedHeaders(w, p)
 
 	// A cache hit knows its exact token counts before the first byte, which a
 	// live stream never does. Replacing the pre-flight estimate with the real
@@ -420,11 +540,18 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gat
 	created := time.Now().Unix()
 
 	finish := func(outcome meter.Outcome, err error) {
+		p.RecordAttempts(&rec)
 		rec.ProviderDuration = time.Since(providerStart)
 		rec.Duration = time.Since(start)
 		rec.Outcome = outcome
 		if err != nil {
 			rec.ErrorClass = string(provider.ClassOf(err))
+			// Past the first token no failover is honest (ADR-0003), so this
+			// failure is the residual risk of that decision rather than an
+			// ordinary error. Counted separately, because the ADR says the
+			// choice gets revisited with data if the gap turns out larger than
+			// expected — and this is the data.
+			rec.StreamFailedAfterTTFT = rec.TTFT > 0
 		}
 		s.record(rec)
 	}
@@ -459,6 +586,10 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gat
 		if firstToken.IsZero() && (chunk.Text != "" || chunk.ToolCall != nil) {
 			firstToken = time.Now()
 			rec.TTFT = firstToken.Sub(start)
+			// The endpoint's latency signal, reported here because the executor
+			// is long gone: it returned when the stream opened, and this is the
+			// first moment the model has actually said anything.
+			s.gw.ObserveTTFT(p, rec.TTFT)
 		}
 		if chunk.FinishReason != "" {
 			rec.FinishReason = string(chunk.FinishReason)
@@ -584,6 +715,20 @@ func (s *Server) logCompletion(r *http.Request, p *gateway.Prepared, rec meter.R
 
 	if rec.CacheHit {
 		attrs = append(attrs, slog.Bool("cache_hit", true))
+	}
+	if e := p.Escalation; e != nil {
+		// The detail goes here and nowhere else. The header carries the reason
+		// code because a header is bounded; this is where "arguments for
+		// get_weather do not parse" survives long enough to be useful when
+		// somebody asks why a route's escalation rate climbed last Tuesday.
+		attrs = append(attrs,
+			slog.String("escalated_from", e.From),
+			slog.String("escalated_to", e.To),
+			slog.String("escalation_reason", string(e.Reason)),
+			slog.String("escalation_detail", e.Detail),
+			slog.Bool("escalation_recovered", e.Recovered),
+			slog.String("discarded_cost", rec.DiscardedCost.String()),
+		)
 	}
 	if len(p.Decision.Optimizations) > 0 {
 		// Reasons included here and nowhere else. The header has no room and the

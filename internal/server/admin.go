@@ -7,6 +7,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/Shashank-Panda/relay/internal/admit"
+	"github.com/Shashank-Panda/relay/internal/catalog"
+	"github.com/Shashank-Panda/relay/internal/health"
 	"github.com/Shashank-Panda/relay/internal/meter"
 	"github.com/Shashank-Panda/relay/internal/respcache"
 )
@@ -34,6 +37,14 @@ type Admin struct {
 	// not saving me anything" — which without them requires a debugger.
 	cache *respcache.Store
 	stats *meter.RouteStats
+
+	// health and admit are the two Phase 4 components an operator needs to see
+	// during an incident. "Why is that endpoint not being selected" and "why am
+	// I getting 503s" both have exact answers, and neither is guessable from
+	// the outside.
+	health *health.Tracker
+	admit  *admit.Limiter
+	store  *catalog.Store
 }
 
 func NewAdmin(agg *meter.Aggregator, m *meter.Meter, reg *prometheus.Registry) *Admin {
@@ -47,6 +58,15 @@ func (a *Admin) WithOptimizer(cache *respcache.Store, stats *meter.RouteStats) *
 	return a
 }
 
+// WithReliability attaches the breaker view, the admission limiter, and the
+// catalog store.
+func (a *Admin) WithReliability(h *health.Tracker, l *admit.Limiter, st *catalog.Store) *Admin {
+	a.health = h
+	a.admit = l
+	a.store = st
+	return a
+}
+
 func (a *Admin) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -54,6 +74,7 @@ func (a *Admin) Handler() http.Handler {
 		mux.Handle("GET /metrics", promhttp.HandlerFor(a.registry, promhttp.HandlerOpts{}))
 	}
 	mux.HandleFunc("GET /savings", a.handleSavings)
+	mux.HandleFunc("GET /health", a.handleHealth)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -107,6 +128,12 @@ func (a *Admin) handleSavings(w http.ResponseWriter, r *http.Request) {
 		ResponseCache respcache.Stats `json:"response_cache"`
 		CacheHitRate  float64         `json:"response_cache_hit_rate"`
 
+		// EscalationRate is the ADR-0009 SLO, measured against the requests that
+		// were actually eligible for an escalation rather than against all of
+		// them — a tenant running mostly strict traffic would otherwise show a
+		// rate near zero however badly their downgrades were doing.
+		EscalationRate float64 `json:"escalation_rate"`
+
 		// RouteOutputP95 is the observed output length per route, and the reason
 		// it is exposed: the output-ceiling lever declines to act on a route
 		// without enough history, and an absent entry here is the whole
@@ -119,6 +146,7 @@ func (a *Admin) handleSavings(w http.ResponseWriter, r *http.Request) {
 		DroppedRecords:   a.meter.Dropped(),
 		Incomplete:       a.meter.Dropped() > 0,
 		CachedInputShare: rep.Overall.CachedInputShare(),
+		EscalationRate:   rep.Overall.EscalationRate(),
 		ResponseCache:    a.cache.Stats(),
 		CacheHitRate:     a.cache.Stats().HitRate(),
 		RouteOutputP95:   a.stats.Routes(),
@@ -129,4 +157,50 @@ func (a *Admin) handleSavings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, body)
+}
+
+// handleHealth answers "why is Relay behaving like this".
+//
+// Distinct from the data plane's /healthz, which answers "is the process
+// alive" for a load balancer. This is the operator view during an incident:
+// which endpoints the breakers have removed from routing, how full the
+// admission gates are, and how old the catalog snapshot is.
+//
+// The catalog age is the one that will be least expected and matters most. A
+// stale snapshot produces correct responses at stale prices indefinitely and
+// reports nothing wrong anywhere else — ADR-0010 calls it the sharpest edge of
+// failing open, and this is where it becomes visible.
+func (a *Admin) handleHealth(w http.ResponseWriter, r *http.Request) {
+	type catalogView struct {
+		Version string  `json:"version,omitempty"`
+		AgeS    float64 `json:"age_seconds"`
+		Stale   bool    `json:"stale"`
+		Note    string  `json:"note,omitempty"`
+	}
+
+	var cat catalogView
+	if a.store != nil {
+		cat.AgeS = a.store.Age().Seconds()
+		cat.Stale = a.store.Stale()
+		if c := a.store.Current(); c != nil {
+			cat.Version = c.Version
+		}
+		if cat.Stale {
+			cat.Note = "snapshot is past its maximum age; routing has degraded to " +
+				"baseline passthrough rather than optimizing against prices nobody has confirmed"
+		}
+	}
+
+	writeJSON(w, http.StatusOK, struct {
+		Breakers  []health.Report `json:"breakers"`
+		Admission admit.Stats     `json:"admission"`
+		Catalog   catalogView     `json:"catalog"`
+		Note      string          `json:"note"`
+	}{
+		Breakers:  a.health.Reports(),
+		Admission: a.admit.Stats(),
+		Catalog:   cat,
+		Note: "Per-process. Breaker state and latency are not shared across replicas " +
+			"(architecture section 7), so behind N instances this is one instance's view.",
+	})
 }

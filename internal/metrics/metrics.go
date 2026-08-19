@@ -87,6 +87,51 @@ type Metrics struct {
 	// perfectly healthy (ADR-0010).
 	Degraded *prometheus.CounterVec
 
+	// Retries and Failovers separate the two ways a request costs more than one
+	// call. A retry is the same endpoint again; a failover is a different one.
+	// They have different causes and different fixes, and a single "attempts"
+	// counter would hide both.
+	Retries   *prometheus.CounterVec
+	Failovers *prometheus.CounterVec
+	Reroutes  *prometheus.CounterVec
+
+	// AttemptFailures counts calls rather than requests, so one request that
+	// retried twice and failed over contributes three observations against the
+	// endpoints that actually failed. The ledger cannot answer this: a record
+	// names the endpoint that *answered*, so deriving per-endpoint failures
+	// from it would credit them to whichever endpoint rescued the request.
+	AttemptFailures *prometheus.CounterVec
+
+	// StreamFailuresAfterTTFT is the failure ADR-0003 knowingly does not cover:
+	// past the first byte no failover is honest. Monitored on its own so the
+	// size of that gap is a measurement rather than an assumption.
+	StreamFailuresAfterTTFT *prometheus.CounterVec
+
+	// BreakersOpen is how many endpoints are currently removed from routing.
+	BreakersOpen prometheus.Gauge
+
+	// Shed counts requests refused for capacity, by which gate refused them.
+	Shed *prometheus.CounterVec
+
+	// Escalations counts downgrades whose output failed a validity check, by the
+	// endpoint that produced it and what was wrong with it.
+	//
+	// The endpoint label is the one that failed, not the baseline that rescued
+	// the request — attributing it to the rescuer would point an operator at the
+	// endpoint doing its job. Read as a rate against substitutions_total, this
+	// is the ADR-0009 SLO: under 2% per route.
+	Escalations *prometheus.CounterVec
+
+	// DiscardedCost is money spent on answers that were thrown away. It is the
+	// price of the escalation backstop, and it is included in cost_usd_total —
+	// this is the part of that total that bought nothing.
+	DiscardedCost *prometheus.CounterVec
+
+	// QualityPenalty is the observed downward revision of each endpoint's
+	// asserted quality. Non-zero means routing has stopped trusting the catalog
+	// about that endpoint.
+	QualityPenalty *prometheus.GaugeVec
+
 	MeterDropped  prometheus.Counter
 	StreamsActive prometheus.Gauge
 
@@ -208,6 +253,63 @@ func New(reg prometheus.Registerer) *Metrics {
 				"and nothing else will say so.",
 		}, []string{"component", "reason"}),
 
+		Retries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "retries_total",
+			Help: "Repeat attempts against the same endpoint, labelled with the endpoint " +
+				"that failed. Every one is a second charge.",
+		}, []string{"endpoint", "class"}),
+
+		AttemptFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "attempt_failures_total",
+			Help: "Failed provider calls, by the endpoint that failed and the error class. " +
+				"Unlike requests_total this counts calls, so one request can appear several times.",
+		}, []string{"endpoint", "class"}),
+
+		Failovers: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "failovers_total",
+			Help: "Requests that abandoned an endpoint and were served by another.",
+		}, []string{"route"}),
+
+		Reroutes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "reroutes_total",
+			Help: "Requests re-routed after a provider rejected the routing constraints. " +
+				"A rising rate means the token estimate is systematically wrong.",
+		}, []string{"route"}),
+
+		StreamFailuresAfterTTFT: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "stream_failures_after_ttft_total",
+			Help: "Streams that broke after the client had received content, where " +
+				"failover is not available. The measured size of ADR-0003's gap.",
+		}, []string{"endpoint"}),
+
+		BreakersOpen: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "circuit_breakers_open",
+			Help: "Endpoints currently removed from routing by their circuit breaker.",
+		}),
+
+		Shed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "shed_total",
+			Help: "Requests refused for capacity, by the gate that refused them.",
+		}, []string{"reason"}),
+
+		Escalations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "escalations_total",
+			Help: "Downgrades whose output failed a validity check and were retried on " +
+				"the baseline, by the endpoint that failed and why.",
+		}, []string{"route", "endpoint", "reason", "recovered"}),
+
+		DiscardedCost: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "discarded_cost_usd_total",
+			Help: "Money spent on answers that were thrown away. Already inside " +
+				"relay_cost_usd_total; this is the part of it that bought nothing.",
+		}, []string{"tenant"}),
+
+		QualityPenalty: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace, Name: "quality_penalty",
+			Help: "Observed downward revision of an endpoint's asserted quality. " +
+				"Non-zero means routing has stopped trusting the catalog about it.",
+		}, []string{"endpoint"}),
+
 		MeterDropped: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace, Name: "meter_dropped_total",
 			Help: "Ledger records lost to a full buffer. Non-zero means the savings report is incomplete.",
@@ -226,6 +328,9 @@ func New(reg prometheus.Registerer) *Metrics {
 			m.Substitutions, m.Unmeasured, m.UsageEstimated,
 			m.Optimizations, m.BreakpointsInserted, m.OptimizeDuration,
 			m.CacheHits, m.CacheMisses, m.Truncated, m.Degraded,
+			m.Retries, m.Failovers, m.Reroutes, m.AttemptFailures, m.StreamFailuresAfterTTFT,
+			m.BreakersOpen, m.Shed,
+			m.Escalations, m.DiscardedCost, m.QualityPenalty,
 			m.MeterDropped, m.StreamsActive,
 		)
 	}
@@ -278,6 +383,21 @@ func (m *Metrics) Write(r meter.Record) {
 	}
 	if r.FinishReason == string(provider.FinishLength) {
 		m.Truncated.WithLabelValues(r.Endpoint, ceilingSource(r)).Inc()
+	}
+
+	if r.Failovers > 0 {
+		m.Failovers.WithLabelValues(route).Add(float64(r.Failovers))
+	}
+	if r.Rerouted {
+		m.Reroutes.WithLabelValues(route).Inc()
+	}
+	if r.StreamFailedAfterTTFT {
+		m.StreamFailuresAfterTTFT.WithLabelValues(r.Endpoint).Inc()
+	}
+	if r.Escalated {
+		m.Escalations.WithLabelValues(
+			route, r.EscalatedFrom, r.EscalationCause, boolLabel(r.EscalationRecovered)).Inc()
+		m.DiscardedCost.WithLabelValues(r.Tenant).Add(r.DiscardedCost.Dollars())
 	}
 
 	m.Cost.WithLabelValues(r.Tenant, r.Endpoint).Add(r.Cost.Dollars())
@@ -339,6 +459,59 @@ func (m *Metrics) ObserveOptimize(res optimize.Result) {
 	if res.Degraded() {
 		m.Degraded.WithLabelValues("optimizer", string(res.Outcome)).Inc()
 	}
+}
+
+// ObserveAttempt records one provider call as it happens.
+//
+// Per attempt rather than per request, because that is the only place the
+// failing endpoint is still known. A retry counted against the ledger record
+// would be labelled with the endpoint that eventually answered — pointing an
+// operator at the healthy provider during an incident caused by the broken one.
+func (m *Metrics) ObserveAttempt(endpoint string, retry int, class string) {
+	if m == nil {
+		return
+	}
+	if class != "" {
+		m.AttemptFailures.WithLabelValues(endpoint, class).Inc()
+	}
+	if retry > 0 {
+		m.Retries.WithLabelValues(endpoint, or(class, "recovered")).Inc()
+	}
+}
+
+// ObserveDegraded counts one fail-open path being taken.
+//
+// The metric ADR-0010 makes non-optional. Passthrough is silent by design — the
+// customer sees a normal response — so without this, Relay can be optimizing
+// nothing, saving nothing, and still look perfectly healthy on every other
+// dashboard.
+func (m *Metrics) ObserveDegraded(component, reason string) {
+	if m == nil {
+		return
+	}
+	m.Degraded.WithLabelValues(component, reason).Inc()
+}
+
+// ObserveQualityPenalties publishes the observed quality revisions.
+//
+// A gauge has to be pushed, and nothing else observes these from outside a
+// request. Without it the control loop is invisible: routing quietly stops
+// selecting an endpoint and nothing anywhere says why.
+func (m *Metrics) ObserveQualityPenalties(byEndpoint map[string]float64) {
+	if m == nil {
+		return
+	}
+	for id, p := range byEndpoint {
+		m.QualityPenalty.WithLabelValues(id).Set(p)
+	}
+}
+
+// ObserveBreakers publishes how many endpoints are currently unavailable.
+func (m *Metrics) ObserveBreakers(open int) {
+	if m == nil {
+		return
+	}
+	m.BreakersOpen.Set(float64(open))
 }
 
 // ObserveCacheMiss records a cacheable request that found no entry. Hits are

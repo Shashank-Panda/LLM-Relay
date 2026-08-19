@@ -66,6 +66,20 @@ type Decision struct {
 	Ranked   []ScoredCandidate
 	Rejected []RejectedCandidate
 
+	// Failover is the ordered list of endpoints the executor may try if Chosen
+	// fails, and it is deliberately not simply "the rest of Ranked".
+	//
+	// Failing over changes which model answers, which is the one thing a strict
+	// tenant refused. So the permitted set depends on the mode, and computing it
+	// here rather than in the executor keeps that judgement in the pure,
+	// replayable component: a decision's failover options are part of why it was
+	// made, and the executor should be reading a plan rather than inventing one
+	// during an incident.
+	//
+	// Empty means the request either succeeds on Chosen or fails, which is the
+	// correct answer for a pinned model with no equivalent endpoint behind it.
+	Failover []string
+
 	// Optimizations lists every adjustment the optimizer made to the request,
 	// with before and after values.
 	//

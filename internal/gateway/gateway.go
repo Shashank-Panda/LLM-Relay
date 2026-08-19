@@ -2,10 +2,12 @@ package gateway
 
 import (
 	"context"
+	"time"
 
 	"github.com/Shashank-Panda/relay/internal/catalog"
 	"github.com/Shashank-Panda/relay/internal/domain"
 	"github.com/Shashank-Panda/relay/internal/execute"
+	healthpkg "github.com/Shashank-Panda/relay/internal/health"
 	"github.com/Shashank-Panda/relay/internal/meter"
 	"github.com/Shashank-Panda/relay/internal/optimize"
 	"github.com/Shashank-Panda/relay/internal/provider"
@@ -36,6 +38,23 @@ type Gateway struct {
 	// Cache is the exact-match response cache. Nil disables it entirely,
 	// regardless of what any route says.
 	Cache *respcache.Store
+
+	// Health is the circuit-breaker and latency view. Nil means every endpoint
+	// is treated as available with unknown latency, which is Phase 1's
+	// behaviour and is the fail-open direction: an absent health signal must
+	// mean "route normally", never "refuse to route" (ADR-0010).
+	Health *healthpkg.Tracker
+
+	// OnDegraded counts each fail-open path taken. Nil is safe and is how the
+	// degradations become invisible, which is the specific failure ADR-0010
+	// exists to prevent — so production wires it and tests may not.
+	OnDegraded func(component, reason string)
+}
+
+func (g *Gateway) degraded(component, reason string) {
+	if g.OnDegraded != nil {
+		g.OnDegraded(component, reason)
+	}
 }
 
 // Compile-time proof that the metering histogram satisfies what the optimizer
@@ -93,6 +112,25 @@ type Prepared struct {
 	// no route declares as its baseline.
 	Route *domain.Route
 
+	// Policy is the tenant policy this request ran under. Held because a
+	// Reroute has to re-filter with the same policy the first pass used —
+	// re-deriving it mid-request would let a config reload change the rules
+	// halfway through one decision.
+	Policy *domain.Policy
+
+	// Attempts is every provider call this request made, in order. Empty until
+	// execution.
+	Attempts execute.Attempts
+
+	// Rerouted records that a provider rejected the request on a constraint the
+	// router had wrong, and the router was re-run with it corrected.
+	Rerouted bool
+
+	// Escalation is set when a downgrade produced invalid output and the
+	// baseline was retried; Discarded is what the abandoned attempt cost.
+	Escalation *execute.Escalation
+	Discarded  []execute.Charge
+
 	// PinnedStrict records an explicit X-Relay-Pin: strict on this request.
 	//
 	// Distinct from a tenant whose mode is strict, and the distinction is
@@ -146,6 +184,21 @@ func (g *Gateway) Prepare(req *domain.NormalizedRequest, tn *tenant.Tenant, mode
 	mode := ResolveMode(pin, pol)
 	pinned := domain.BaselineMode(pin) == domain.ModeStrict
 
+	// A snapshot past its maximum age degrades to serving what was asked for.
+	//
+	// This is the one fail-open path that gets *more* conservative rather than
+	// less. Everywhere else, degrading means doing less work and serving
+	// anyway; here it means declining to make cost and quality decisions from
+	// prices nobody has confirmed recently. A stale catalog does not error — it
+	// routes, confidently, on numbers that stopped being true, and every
+	// savings figure computed against them is wrong in a way that looks
+	// entirely plausible. ADR-0010 names this the sharpest edge of failing open.
+	stale := g.Store.Stale()
+	if stale && mode != domain.ModeStrict {
+		g.degraded("catalog", "stale_snapshot")
+		mode = domain.ModeStrict
+	}
+
 	if tn != nil {
 		req.Tenant = tn.ID
 	}
@@ -165,6 +218,7 @@ func (g *Gateway) Prepare(req *domain.NormalizedRequest, tn *tenant.Tenant, mode
 		RequestedModel: model,
 		Tenant:         tn,
 		PinnedStrict:   pinned,
+		Policy:         pol,
 	}
 	if rt, ok := cat.Route(routeName); ok {
 		p.Route = rt
@@ -173,6 +227,9 @@ func (g *Gateway) Prepare(req *domain.NormalizedRequest, tn *tenant.Tenant, mode
 	if !pinned {
 		p.Optimize = optimize.New(pol.Levers).Run(req, g.Stats)
 		p.Request = p.Optimize.Request
+		if p.Optimize.Degraded() {
+			g.degraded("optimizer", string(p.Optimize.Outcome))
+		}
 	} else {
 		p.Optimize = optimize.Result{Request: req, Outcome: optimize.OutcomeApplied}
 	}
@@ -184,6 +241,10 @@ func (g *Gateway) Prepare(req *domain.NormalizedRequest, tn *tenant.Tenant, mode
 		Request: p.Request.RoutingView(),
 		Catalog: cat,
 		Policy:  pol,
+		// Endpoints with an open breaker are eliminated during filtering rather
+		// than failed during execution, so the recorded ranking stays honest
+		// about what was actually available at decision time.
+		Health: g.Health.Snapshot(),
 	})
 	if err != nil {
 		return nil, err
@@ -195,6 +256,14 @@ func (g *Gateway) Prepare(req *domain.NormalizedRequest, tn *tenant.Tenant, mode
 	// see is indistinguishable from a bug (ADR-0008).
 	d.Optimizations = p.Optimize.Applied
 	p.Decision = d
+
+	if d.UsedFallback {
+		// Filtering eliminated every candidate and the route's fallback (or the
+		// baseline) was served instead. The request succeeded, which is the
+		// point — but a route whose constraints exclude everything it lists is
+		// misconfigured, and nothing else would ever say so.
+		g.degraded("routing", "no_viable_candidate")
+	}
 
 	p.resolveCacheKey(g.Cache)
 	return p, nil
@@ -290,22 +359,156 @@ func (p *Prepared) NewRecord(streaming bool) meter.Record {
 	}
 }
 
+// SubstitutedModel reports whether a *different model* answered.
+//
+// Distinct from Decision.Substituted, which compares endpoint IDs, and the
+// distinction became load-bearing the moment failover existed. An endpoint is a
+// (model, deployment, credential) triple, so moving from us-east to eu-west
+// changes the endpoint and not the answer — reporting that as a substitution
+// tells a caller they were served a cheaper model when they were served the
+// same one from a different region.
+//
+// The narrower reading is the one the product claim is about, so it is the one
+// the disclosure header and the substitutions counter use.
+func (p *Prepared) SubstitutedModel() bool {
+	if p.Decision == nil || !p.Decision.Substituted() {
+		return false
+	}
+	served, ok := p.Catalog.Endpoint(p.Decision.Chosen)
+	base, ok2 := p.Catalog.Endpoint(p.Decision.Baseline.EndpointID)
+	if !ok || !ok2 {
+		// Cannot tell. Report the substitution: over-disclosing is a worse
+		// header and a better default than quietly under-disclosing one.
+		return true
+	}
+	return served.Model != base.Model || served.Provider != base.Provider
+}
+
+// FailedOver reports that a different endpoint answered while the model stayed
+// the same — a recovery rather than a substitution.
+func (p *Prepared) FailedOver() bool {
+	return p.Decision != nil && p.Decision.Substituted() && !p.SubstitutedModel()
+}
+
+// RecordAttempts folds the execution trail into a ledger entry.
+//
+// Called after execution rather than folded into NewRecord, because a record is
+// built before the first provider call — it has to be, so that a failure has
+// somewhere to be written down.
+func (p *Prepared) RecordAttempts(r *meter.Record) {
+	r.Attempts = len(p.Attempts)
+	r.Retries = p.Attempts.Retries()
+	r.Failovers = p.Attempts.Failovers()
+	r.Rerouted = p.Rerouted
+	// Chosen may have moved during execution, and the ledger records what
+	// answered rather than what was selected.
+	r.Endpoint = p.Decision.Chosen
+	// The narrower reading: the substitutions figure in a savings report is the
+	// product's claim about serving a different model, not a count of regional
+	// failovers.
+	r.Substituted = p.SubstitutedModel()
+}
+
+// executeRequest builds the executor call for this prepared request.
+//
+// The Reroute callback is the interesting field. A Reroute class means the
+// constraint set used for routing was wrong — almost always a context estimate
+// that four-bytes-per-token got wrong on non-English text — so the executor
+// hands back a corrected request and this re-runs the same router with the same
+// policy against the same catalog snapshot. Same inputs but one, which is what
+// makes the second decision explainable next to the first.
+func (p *Prepared) executeRequest(streaming bool) execute.Request {
+	return execute.Request{
+		Request:   p.Request,
+		Catalog:   p.Catalog,
+		Decision:  p.Decision,
+		Streaming: streaming,
+		Reroute:   execute.Rerouter(p.Catalog, p.Policy),
+	}
+}
+
+// absorb folds the executor's outcome back into the decision.
+//
+// Mutating the Decision after routing, deliberately and for the same reason the
+// optimizations are attached to it: the Decision is what gets recorded and
+// disclosed, and a ledger that named the endpoint Relay *intended* to use would
+// bill a customer against a model that never ran. After a failover or a reroute,
+// Chosen is the endpoint that actually answered.
+func (p *Prepared) absorb(res execute.Result) {
+	p.Attempts = res.Attempts
+	p.Rerouted = res.Rerouted
+	p.Escalation = res.Escalation
+	p.Discarded = res.Discarded
+
+	if res.Endpoint != nil && res.Endpoint.ID != "" {
+		p.Decision.Chosen = res.Endpoint.ID
+	}
+}
+
+// ObserveTTFT reports a stream's time-to-first-token to the health tracker.
+//
+// Reported from the server rather than the executor because the executor is
+// gone by then: it returns once the stream is open, and the first token arrives
+// later. TTFT is the right latency signal for a stream — total duration is
+// dominated by how long the answer is, which is a property of the request
+// rather than of the endpoint, so feeding it to the scorer would rank endpoints
+// by the verbosity of whoever happened to call them.
+func (g *Gateway) ObserveTTFT(p *Prepared, ttft time.Duration) {
+	if g.Health == nil || ttft <= 0 || p.CacheHit {
+		return
+	}
+	ep, ok := p.Catalog.Endpoint(p.Decision.Chosen)
+	if !ok {
+		return
+	}
+	g.Health.Observe(healthpkg.Key{Endpoint: ep.ID, Credential: ep.CredentialRef}, "", ttft)
+}
+
 // Chat executes a prepared non-streaming request, serving from cache when it
 // can and populating the cache when it cannot.
+//
+// Retries and failover happen inside the executor; what happens here is
+// recording their outcome, because the ledger has to say which endpoint
+// actually answered rather than which one was chosen.
 func (g *Gateway) Chat(ctx context.Context, p *Prepared) (*provider.Response, *domain.ModelEndpoint, execute.Attempt, error) {
-	ep, _ := p.Catalog.Endpoint(p.Decision.Chosen)
-
 	if e, ok := g.cacheGet(p); ok {
+		ep, _ := p.Catalog.Endpoint(p.Decision.Chosen)
 		p.CacheHit = true
 		p.CachedUsage = e.Usage
 		return e.Response(), ep, execute.Attempt{EndpointID: p.Decision.Chosen}, nil
 	}
 
-	resp, ep, att, err := g.Executor.Chat(ctx, p.Request, p.Catalog, p.Decision)
-	if err == nil {
-		g.cachePut(p, resp.ID, resp.Parts, resp.FinishReason, resp.Usage)
+	res, err := g.Executor.Run(ctx, p.executeRequest(false))
+	p.absorb(res)
+
+	if err == nil && res.Response != nil {
+		g.cachePut(p, res.Response.ID, res.Response.Parts, res.Response.FinishReason, res.Response.Usage)
 	}
-	return resp, ep, att, err
+	g.observeQuality(p, res)
+	return res.Response, res.Endpoint, res.Attempts.Last(), err
+}
+
+// observeQuality feeds the escalation outcome back into the health tracker.
+//
+// This is the half of ADR-0009 that makes the cascade a control loop rather than
+// a safety net. Escalating recovers one request; feeding the rate back is what
+// stops the same endpoint being chosen for the next thousand.
+//
+// The endpoint credited is the one that *produced the answer that was judged* —
+// on an escalation that is the downgrade whose output failed, not the baseline
+// that rescued it. Attributing it to the baseline would penalise the endpoint
+// that did its job.
+func (g *Gateway) observeQuality(p *Prepared, res execute.Result) {
+	if g.Health == nil || p.CacheHit {
+		return
+	}
+	if esc := res.Escalation; esc != nil {
+		g.Health.ObserveServed(esc.From, true)
+		return
+	}
+	if res.Endpoint != nil {
+		g.Health.ObserveServed(res.Endpoint.ID, false)
+	}
 }
 
 // Stream executes a prepared streaming request. The caller owns the returned
@@ -322,7 +525,10 @@ func (g *Gateway) Stream(ctx context.Context, p *Prepared) (provider.Stream, *do
 		return e.Stream(), ep, execute.Attempt{EndpointID: p.Decision.Chosen}, nil
 	}
 
-	st, ep, att, err := g.Executor.Stream(ctx, p.Request, p.Catalog, p.Decision)
+	res, err := g.Executor.Run(ctx, p.executeRequest(true))
+	p.absorb(res)
+
+	st, ep, att := res.Stream, res.Endpoint, res.Attempts.Last()
 	if err != nil || p.CacheKey == "" {
 		return st, ep, att, err
 	}
@@ -384,4 +590,43 @@ func (p *Prepared) Price(r *meter.Record, u provider.Usage) {
 		return
 	}
 	r.Price(u, p.Catalog, p.Decision)
+	p.priceDiscarded(r)
+}
+
+// priceDiscarded folds the cost of abandoned attempts into the record.
+//
+// This is the arithmetic that makes cascade escalation honest. The served cost
+// above is the baseline's, priced against a baseline of the same endpoint — a
+// saving of exactly zero. Adding what the failed downgrade cost pushes Saved
+// negative by that amount, which is the truth: the customer paid for two answers
+// and used one.
+//
+// It runs after Price rather than inside it because Price is the definition of
+// the single-attempt case and every other caller depends on that meaning.
+func (p *Prepared) priceDiscarded(r *meter.Record) {
+	if len(p.Discarded) == 0 {
+		return
+	}
+	for _, c := range p.Discarded {
+		ep, ok := p.Catalog.Endpoint(c.EndpointID)
+		if !ok {
+			continue
+		}
+		cost := c.Usage.Cost(ep)
+		r.DiscardedCost += cost
+		r.Cost += cost
+	}
+
+	if r.SavingMeasured {
+		// Recomputed rather than adjusted, so there is one expression of what
+		// Saved means and it stays true after this.
+		r.Saved = r.BaselineCost - r.Cost
+	}
+
+	if e := p.Escalation; e != nil {
+		r.Escalated = true
+		r.EscalatedFrom = e.From
+		r.EscalationCause = string(e.Reason)
+		r.EscalationRecovered = e.Recovered
+	}
 }

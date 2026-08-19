@@ -1,0 +1,10 @@
+# The savings ledger. `-ledger` defaults to this path, so anyone who runs the
+# gateway from a checkout creates it — and it holds per-tenant cost data written
+# 0600 on purpose. Billing-adjacent data does not belong in a git history.
+/data/
+
+# Built binaries.
+/relay
+/relay.exe
+/relay-eval
+/relay-eval.exe

@@ -127,7 +127,15 @@ func TestDeterminism(t *testing.T) {
 	cfg := domain.RecommendedLevers()
 	cfg.EffortDownshift = true
 	cfg.DefaultEffort = domain.EffortLow
-	o := New(cfg)
+
+	// Budget disabled, and that is the claim rather than a way around it. The
+	// levers are a pure function of (request, config, stats); the budget is a
+	// deliberate wall-clock escape hatch layered over them, so with it enabled
+	// a loaded machine can legitimately produce a shorter pass. Leaving it on
+	// here would test the scheduler, and would fail on CI roughly whenever CI
+	// was busy — the classic test that gets deleted rather than understood.
+	// The budget has its own tests, with a fake clock.
+	o := New(cfg).WithBudget(0)
 
 	want, wantOps := o.Apply(baseRequest(), statsWith(300))
 	for i := range 200 {

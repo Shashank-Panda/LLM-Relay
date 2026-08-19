@@ -150,7 +150,7 @@ Two things to watch while doing it. `relay_output_truncated_total{ceiling="relay
 
 ---
 
-## Phase 4 — Reliability and fail-open
+## Phase 4 — Reliability and fail-open — **built, pending live fault drill**
 
 **Goal: safe to be a hard dependency. Prerequisite for ever substituting a model.**
 
@@ -162,11 +162,45 @@ Two things to watch while doing it. `relay_output_truncated_total{ceiling="relay
 - Per-attempt timeouts within a total request deadline; admission control and load shedding
 - **Fail-open passthrough on every internal failure**, with `relay_degraded_total` and its alert ([ADR-0010](adr/0010-fail-open-availability.md))
 
+
+**What "failover" is allowed to mean, because it collides with the strict-mode promise.** Failing over changes which endpoint answers, and a strict tenant's whole purchase is that they get the model they named. Resolving that by refusing failover in strict mode would make the safest setting the least available one; resolving it by allowing failover to any candidate would perform the substitution they declined during exactly the incident where they are least able to notice.
+
+The resolution is that an endpoint is a `(model, deployment, credential)` triple, so those are two different moves:
+
+- **Strict and shadow** fail over only to endpoints running the **same model** — another region, another credential. The model that answers is the one the caller named, so the promise holds exactly, and `X-Relay-Failover` discloses it as a recovery.
+- **Optimize** already has permission to choose among the ranked candidates, so the ranking is the failover order.
+
+The permitted set is computed by the router and recorded on the `Decision`, not derived by the executor. A decision's failover options are part of why it was made, and the executor should be reading a plan rather than inventing one mid-incident. `X-Relay-Substituted` now means *a different model answered* and nothing weaker — reporting a region failover as a substitution would tell a caller they were downgraded when they were not, and it would put regional recoveries into the substitutions figure on a savings report.
+
+**Two bounds that could not be expressed with `context.WithTimeout`.** A streaming request has two lifetimes stacked on one context: opening the stream must be bounded, and generating the answer must not be. There is no way to stand a `WithTimeout` timer down without cancelling the context it guards, so both the attempt timeout and the total deadline are a `WithCancel` plus a stoppable `AfterFunc`, disarmed at the moment the stream opens and handed to the stream to cancel on `Close`. The first version of this used `defer cancel()` and killed every stream the instant execution returned — caught by a Phase 1 test, which is the argument for having written that test.
+
+**What it needed that was not on the list.** The `latency` scoring dimension had always been read by the scorer and written by nothing, so every endpoint scored identically on it and the weight was spent on nothing. `internal/health` produces both signals from the same observation point, because a completed attempt is the only event that reports on either: circuit state per `(endpoint, credential)`, and a latency EWMA per endpoint fed from time-to-first-token on streams and total duration otherwise.
+
 **Done when:** fault injection produces correct behavior for every error class, and killing Postgres, Redis, and the Optimizer in turn degrades savings without dropping a single request.
+
+**Verification status.** The error-class matrix is a table test: `RetrySame` retries the same endpoint under bounded exponential backoff with full jitter, `RetryOther` moves on immediately, `Reroute` re-filters with a corrected estimate, and `Terminal` and `Cancelled` stop outright — each asserted on the exact sequence of provider calls, because asserting on the returned error alone would pass for an implementation that quietly made three of them. A provider's `Retry-After` overrides the computed backoff and is still capped. ADR-0003's boundary is pinned from both sides: a pre-first-byte failure moves to the next candidate, and a break after the first flushed chunk does not, with the residual counted as `relay_stream_failures_after_ttft_total` — the measurement the ADR asks for before that decision gets revisited.
+
+Live against a fault-injecting mock, a dead `us-east` deployment produced `X-Relay-Failover: true`, `X-Relay-Attempts: 4`, and a 200 served from `eu-west`; `/health` showed the breaker open on the failing endpoint with the healthy one still closed and carrying a latency EWMA. Two bugs surfaced doing this rather than in review: `Meter.Record` sent on a closed channel during shutdown, turning a graceful drain into a panic — the exact class of internal failure ADR-0010 forbids surfacing — and `relay_retries_total` was labelled with the endpoint that *answered*, which would point an operator at the healthy provider during an incident caused by the broken one. Both are fixed, the first by never closing the channel and the second by a per-attempt hook, since a ledger record cannot carry a fact that differs per attempt.
+
+The **fault drill** in the second half of "done when" is still open, and most of it is not buildable yet: there is no Postgres and no Redis to kill until Phase 7. What exists of it is covered — the optimizer's fail-open has a test that crashes a `StatsSource` mid-request, a stale catalog degrades to baseline passthrough rather than routing on unconfirmed prices, and an unwritable ledger costs the record rather than the request. To close the rest, once those dependencies exist:
+
+```sh
+# With traffic running, kill each dependency in turn and watch two numbers.
+# The failure mode being tested for is a *quiet* one: everything below should
+# keep returning 200s while the savings rate falls.
+watch -n1 'curl -s localhost:9090/metrics | grep -E "relay_degraded_total|relay_requests_total"'
+
+# And the alert that makes this real, because passthrough is silent by design:
+#   rate(relay_degraded_total[5m]) > 0
+# without it Relay can be optimizing nothing, saving nothing, and still look
+# perfectly healthy on every other dashboard.
+```
+
+One thing to watch that the drill will not show: `relay_output_truncated_total` and `relay_stream_failures_after_ttft_total` are both low-rate signals that only matter in aggregate, so they need a week of real traffic rather than an afternoon of injected faults.
 
 ---
 
-## Phase 5 — Routing, quality floor, and substitution
+## Phase 5 — Routing, quality floor, and substitution — **built, pending live escalation-rate data**
 
 **Goal: turn on the headline feature, with its guardrails already in place.**
 
@@ -178,7 +212,44 @@ Two things to watch while doing it. `relay_output_truncated_total{ceiling="relay
 - Offline eval harness producing quality scores per task type
 - `X-Relay-Dry-Run`; exhaustive table tests over `Route` — highest test density in the project
 
+
+**What the cascade can and cannot do, stated before it is relied on.** The validity checks detect *invalid* output, never *worse* output. A cheaper model returning a well-formed, schema-valid, subtly inferior answer passes every one of them. So escalation is a floor on correctness and `QualityFloor` is the separate, upstream floor on quality — and the ordering matters, because a reader who takes the cascade as a quality guarantee has been given a stronger promise than the code makes.
+
+One rule governs every check: **when in doubt, valid.** The two failure directions are not symmetric. A missed violation costs nothing — the response is returned as it would have been anyway. A false alarm buys a second provider call for output that was fine, which is money, latency, and a negative saving. Every check therefore either proves a violation or declines to judge. The refusal heuristic is the clearest case: `finish_reason: content_filter` is the provider stating a refusal, and text-matching refusal phrasing was left out because it is locale-specific, defeated by paraphrase, and fires on the perfectly good answer to "what should I say when I have to decline a request".
+
+JSON Schema validation is a **documented subset** — type, required, properties, items, enum, `additionalProperties: false` — and every construct it does not understand is skipped rather than guessed at. `anyOf` means the document need only satisfy one branch, and a checker that tested the wrong branch would report a violation that is not one. Full schema validation is a dependency decision that belongs in its own ADR, not smuggled in under a validity check.
+
+**How the loop closes.** ADR-0009 calls escalation rate the control signal, and that only means something if it feeds back. `internal/health` tracks each endpoint's escalation rate as a decaying ratio and exposes it as `EndpointHealth.QualityPenalty`, which is subtracted from the asserted score before the floor is applied and before the endpoint is scored. The penalty *is* the rate, bounded — no curve and no coefficient, so an endpoint returning invalid output on a fifth of requests has an effective quality 0.2 below what the catalog claims, and that is a number anybody can recompute from the ledger.
+
+Two properties keep it from becoming its own failure mode. It is **only ever a penalty**: a low escalation rate is evidence of validity rather than quality, and an endpoint returning well-formed rubbish would otherwise earn a bonus. And it is **bounded** at 0.3, because an unbounded penalty during a bad afternoon would drive an endpoint's effective quality to zero and remove it from every route carrying a floor — converting a quality signal into an outage.
+
+**The eval harness produces the input the floor depends on.** `cmd/relay-eval` runs a suite of objectively-graded cases per task type against real endpoints and emits the catalog `quality:` block, with an attestation. Two constraints on what an eval may assert: no model grades another model, even offline, because a score produced by a judge is a claim about the judge and cannot be reproduced by a customer checking the number; and errored runs are excluded from the denominator rather than counted as failures, because a provider outage during an eval is not evidence about the model. Pasting the result into the catalog is deliberately manual — a score that rewrote the catalog automatically would let one bad afternoon at a provider silently change how every request routes.
+
 **Done when:** the worked example in [routing §7](routing.md#7-a-worked-example) reproduces exactly; a tenant switched from `shadow` to `optimize` shows the predicted saving materialize; and escalation rate stays under 2%.
+
+**Verification status.** The first two are closed. `TestWorkedExample_MatchesDocumentation` reproduces routing §7 to the published decimal — the ranking, the three totals, the winner's four component contributions, the estimated costs, and the 80% saving — and a companion test reproduces the document's own counterfactual, that stripping cache affinity flips the decision to the cheaper model by 0.008.
+
+The shadow-to-optimize claim is a single test running the same request through both modes and asserting the figures are *identical* rather than close: shadow predicts `X-Relay-Shadow-Saved-Usd: 1.080000` while saving nothing, optimize realises `X-Relay-Saved-Usd: 1.080000`. They are the same subtraction over the same catalog, so anything less than equality would mean every shadow report ever shown to a customer was a guess.
+
+Live, an escalating downgrade produced `X-Relay-Escalated: empty_completion`, `X-Relay-Attempts: 2`, and `X-Relay-Saved-Usd: -0.120000`; `/savings` reported `cost 1320000, baseline 1200000, saved -120000, discarded 120000` — the customer paid for two answers and used one, and the ledger says so. `relay_escalations_total` labels the endpoint that *failed*, not the baseline that rescued the request, for the same reason the retry counter does.
+
+The **2% SLO** is the part that cannot be closed here, because it is a claim about production traffic rather than about this code. Everything needed to measure it exists: the rate is reported per route on `/savings` and as `relay_escalations_total`, measured against substitutable requests rather than all of them — against total requests a tenant running mostly strict traffic would show a rate near zero however badly their downgrades were doing. To close it:
+
+```sh
+# Per route, over a window, against the requests that were actually eligible.
+curl -s localhost:9090/savings | jq '{
+  rate: .escalation_rate,
+  escalations: .overall.escalations,
+  eligible: .overall.substitutable_requests,
+  wasted: .overall.discarded_cost_micros
+}'
+
+# The alert that matters, because a rising rate is a quality regression that
+# shows up on an invoice before anyone complains:
+#   rate(relay_escalations_total[1h]) / rate(relay_substitutions_total[1h]) > 0.02
+```
+
+Two things a week of traffic will settle that a test cannot. Whether the quality-penalty bound of 0.3 and its 50-request minimum are the right numbers — both are defensible and neither is measured. And whether the validity checks have a false-positive rate at all: every one of them is conservative by construction, but "conservative by construction" is an argument, and the escalation rate on a route serving a model that is genuinely fine is the measurement.
 
 ---
 

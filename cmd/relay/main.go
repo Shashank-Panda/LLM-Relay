@@ -16,10 +16,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
+	"github.com/Shashank-Panda/relay/internal/admit"
 	"github.com/Shashank-Panda/relay/internal/catalog"
 	"github.com/Shashank-Panda/relay/internal/domain"
 	"github.com/Shashank-Panda/relay/internal/execute"
 	"github.com/Shashank-Panda/relay/internal/gateway"
+	"github.com/Shashank-Panda/relay/internal/health"
 	"github.com/Shashank-Panda/relay/internal/meter"
 	"github.com/Shashank-Panda/relay/internal/metrics"
 	"github.com/Shashank-Panda/relay/internal/provider"
@@ -32,17 +34,24 @@ import (
 )
 
 type config struct {
-	addr         string
-	adminAddr    string
-	catalogPath  string
-	tenantsPath  string
-	ledgerPath   string
-	cacheEntries int
-	cacheMB      int
-	maxPriceAge  time.Duration
-	logLevel     string
-	logFormat    string
-	drainTimeout time.Duration
+	addr           string
+	adminAddr      string
+	catalogPath    string
+	tenantsPath    string
+	ledgerPath     string
+	cacheEntries   int
+	cacheMB        int
+	maxPriceAge    time.Duration
+	maxCatalogAge  time.Duration
+	maxInFlight    int
+	maxStreams     int
+	maxPerEndpoint int
+	totalDeadline  time.Duration
+	attemptTimeout time.Duration
+	maxAttempts    int
+	logLevel       string
+	logFormat      string
+	drainTimeout   time.Duration
 }
 
 func main() {
@@ -71,6 +80,20 @@ func run() error {
 		"exact-match response cache size in MiB")
 	flag.DurationVar(&cfg.maxPriceAge, "max-price-age", 90*24*time.Hour,
 		"reject pricing not verified within this window; 0 disables the check")
+	flag.DurationVar(&cfg.maxCatalogAge, "max-catalog-age", 24*time.Hour,
+		"beyond this, degrade to baseline passthrough rather than route on stale prices; 0 disables")
+	flag.IntVar(&cfg.maxInFlight, "max-in-flight", admit.DefaultConfig().MaxInFlight,
+		"concurrent provider calls before shedding; 0 disables admission control")
+	flag.IntVar(&cfg.maxStreams, "max-streams", admit.DefaultConfig().MaxStreams,
+		"concurrent streaming responses, counted within -max-in-flight")
+	flag.IntVar(&cfg.maxPerEndpoint, "max-per-endpoint", admit.DefaultConfig().MaxPerEndpoint,
+		"concurrent calls to any one endpoint, so a slow provider cannot starve the healthy ones")
+	flag.IntVar(&cfg.maxAttempts, "max-attempts", execute.DefaultPolicy().MaxAttempts,
+		"total provider calls per request, across retries and failover; every one is a real charge")
+	flag.DurationVar(&cfg.attemptTimeout, "attempt-timeout", execute.DefaultPolicy().AttemptTimeout,
+		"bounds one call; for streams it bounds opening the stream, never the stream itself")
+	flag.DurationVar(&cfg.totalDeadline, "request-deadline", execute.DefaultPolicy().TotalDeadline,
+		"bounds attempts and backoff for one request")
 	flag.StringVar(&cfg.logLevel, "log-level", "info", "debug | info | warn | error")
 	flag.StringVar(&cfg.logFormat, "log-format", "json", "json | text")
 	flag.DurationVar(&cfg.drainTimeout, "drain-timeout", 30*time.Second,
@@ -86,7 +109,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	store := catalog.NewStore(cat)
+	store := catalog.NewStore(cat).WithMaxAge(cfg.maxCatalogAge)
 
 	client := provider.NewClient(provider.DefaultClientOptions())
 	registry := provider.NewRegistry(
@@ -149,12 +172,40 @@ func run() error {
 		})
 	}
 
+	// The degradation counter is not optional. Passthrough is silent by design —
+	// the customer sees a normal response — so without this Relay can be
+	// optimizing nothing, saving nothing, and still look healthy on every other
+	// dashboard (ADR-0010). Alert on it.
+	degraded := func(component, reason string) { mx.ObserveDegraded(component, reason) }
+
+	tracker := health.New(health.DefaultConfig())
+
+	limiter := admit.New(admit.Config{
+		MaxInFlight:    cfg.maxInFlight,
+		MaxStreams:     cfg.maxStreams,
+		MaxPerEndpoint: cfg.maxPerEndpoint,
+	})
+
+	executor := execute.New(registry, resolver).
+		WithTracker(tracker).
+		WithDegradedHook(degraded).
+		WithAttemptHook(func(a execute.Attempt) {
+			mx.ObserveAttempt(a.EndpointID, a.Retry, string(a.Class))
+		}).
+		WithPolicy(execute.Policy{
+			MaxAttempts:    cfg.maxAttempts,
+			AttemptTimeout: cfg.attemptTimeout,
+			TotalDeadline:  cfg.totalDeadline,
+		})
+
 	gw := &gateway.Gateway{
-		Store:    store,
-		Executor: execute.New(registry, resolver),
-		Tenants:  tenants,
-		Stats:    stats,
-		Cache:    cache,
+		Store:      store,
+		Executor:   executor,
+		Tenants:    tenants,
+		Stats:      stats,
+		Cache:      cache,
+		Health:     tracker,
+		OnDegraded: degraded,
 		// The fallback when no tenant registry is configured. Strict: nobody
 		// gets substituted by leaving a file absent.
 		Policy: domain.DefaultPolicy(),
@@ -165,6 +216,7 @@ func run() error {
 		Tenants: tenants,
 		Meter:   mtr,
 		Metrics: mx,
+		Admit:   limiter,
 	})
 
 	httpSrv := &http.Server{
@@ -185,12 +237,15 @@ func run() error {
 	var adminSrv *http.Server
 	if cfg.adminAddr != "" {
 		adminSrv = &http.Server{
-			Addr:              cfg.adminAddr,
-			Handler:           server.NewAdmin(agg, mtr, promReg).WithOptimizer(cache, stats).Handler(),
+			Addr: cfg.adminAddr,
+			Handler: server.NewAdmin(agg, mtr, promReg).
+				WithOptimizer(cache, stats).
+				WithReliability(tracker, limiter, store).
+				Handler(),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
 		go func() {
-			log.Info("admin listening", "addr", cfg.adminAddr, "paths", "/metrics /savings")
+			log.Info("admin listening", "addr", cfg.adminAddr, "paths", "/metrics /savings /health")
 			if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				// Not fatal. The control plane going down must not take
 				// inference with it — that is the whole point of the split.
@@ -211,6 +266,14 @@ func run() error {
 				return
 			case <-t.C:
 				mx.ObserveDropped(mtr.Dropped())
+				// A gauge has to be pushed; nothing else observes the breakers
+				// from outside a request, and "how many endpoints are currently
+				// unavailable" is the first question during an incident.
+				mx.ObserveBreakers(tracker.Open())
+				mx.ObserveQualityPenalties(tracker.Penalties())
+				if store.Stale() {
+					degraded("catalog", "stale_snapshot")
+				}
 			}
 		}
 	}()
@@ -226,6 +289,8 @@ func run() error {
 			"tenants", tenants.IDs(),
 			"ledger", orNone(cfg.ledgerPath),
 			"response_cache", cacheDescription(cache, cfg.cacheEntries, cfg.cacheMB),
+			"max_in_flight", cfg.maxInFlight,
+			"max_attempts", cfg.maxAttempts,
 		)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errs <- err

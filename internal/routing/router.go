@@ -85,6 +85,7 @@ func Route(in Input) (*domain.Decision, error) {
 	// specific and did not grant permission to reconsider it.
 	if mode == domain.ModeStrict && hasBaseline {
 		serveBaseline(d, baseline, baselineCost, "strict mode: served as requested")
+		d.Failover = equivalentEndpoints(cat, rt, baseline, in.Health)
 		return d, nil
 	}
 
@@ -115,11 +116,80 @@ func Route(in Input) (*domain.Decision, error) {
 		d.Counterfactual = best.EndpointID
 		d.CounterfactualCost = best.Cost
 		setServed(d, baseline.ID, baselineCost)
+		// Shadow serves the baseline, so its failover rules are strict mode's.
+		// Falling over into the ranking would serve the counterfactual for real,
+		// which is precisely the substitution shadow mode exists to *not* make.
+		d.Failover = equivalentEndpoints(cat, rt, baseline, in.Health)
 		return d, nil
 	}
 
 	setServed(d, best.EndpointID, best.Cost)
+	// Optimize mode already has the tenant's permission to choose among these,
+	// so the ranking is the failover order.
+	for _, c := range d.Ranked[1:] {
+		d.Failover = append(d.Failover, c.EndpointID)
+	}
 	return d, nil
+}
+
+// equivalentEndpoints lists endpoints that serve the same model as the one
+// chosen, for a request that may not be substituted.
+//
+// This is what makes reliability and strictness compatible rather than opposed.
+// A strict tenant said "do not answer me with a different model" — they did not
+// say "if us-east is down, fail my request". An endpoint is a (model,
+// deployment, credential) triple, so the same model in another region is a
+// different endpoint and the same answer, and switching between them honours
+// the promise exactly.
+//
+// Matching on Model rather than on endpoint ID is the whole mechanism: nothing
+// here can select a cheaper or different model, no matter how the route is
+// configured, because a different model has a different name.
+func equivalentEndpoints(
+	cat *domain.Catalog, rt *domain.Route, chosen *domain.ModelEndpoint, h *domain.Health,
+) []string {
+	if chosen == nil {
+		return nil
+	}
+
+	// The route's candidates plus every catalog entry, because an operator who
+	// deployed a second region for redundancy has not necessarily listed it as
+	// a routing candidate — and for a pinned model there may be no route at all.
+	seen := map[string]bool{chosen.ID: true}
+	var out []string
+
+	consider := func(id string) {
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+
+		ep, ok := cat.Endpoint(id)
+		switch {
+		case !ok:
+		case ep.Model != chosen.Model:
+			// A different model. Not available here at any price.
+		case ep.Provider != chosen.Provider:
+			// Same model name at a different vendor is a different model.
+		case ep.Lifecycle.Status == domain.StatusRetired:
+		case ep.CredentialRef == "":
+		case h.For(id).CircuitOpen:
+			// Already known bad. Listing it would spend an attempt discovering
+			// what the breaker already established.
+		default:
+			out = append(out, id)
+		}
+	}
+
+	if rt != nil {
+		for _, id := range rt.Candidates {
+			consider(id)
+		}
+	}
+	for _, id := range domain.SortedKeys(cat.Endpoints) {
+		consider(id)
+	}
+	return out
 }
 
 // setServed records the endpoint that will execute and the saving against the

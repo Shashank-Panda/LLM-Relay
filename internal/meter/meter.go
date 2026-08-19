@@ -35,8 +35,21 @@ type Meter struct {
 	ch    chan Record
 	sinks []Sink
 
-	dropped  atomic.Uint64
-	written  atomic.Uint64
+	dropped atomic.Uint64
+	written atomic.Uint64
+
+	// closed, stop, and done implement shutdown without ever closing ch.
+	//
+	// The obvious implementation closes the record channel and lets the worker's
+	// range loop end. It is also a panic waiting for the right moment: a request
+	// still in flight during shutdown sends on a closed channel and takes the
+	// process down — turning a graceful drain into a crash, and violating the
+	// one rule this whole system is arranged around, that an internal failure
+	// must never become the caller's error (ADR-0010). A separate stop signal
+	// has no such window: a late send lands in the buffer and is simply never
+	// read.
+	closed   atomic.Bool
+	stop     chan struct{}
 	done     chan struct{}
 	stopOnce sync.Once
 }
@@ -48,6 +61,7 @@ func New(buffer int, sinks ...Sink) *Meter {
 	m := &Meter{
 		ch:    make(chan Record, buffer),
 		sinks: sinks,
+		stop:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
 	go m.run()
@@ -56,12 +70,32 @@ func New(buffer int, sinks ...Sink) *Meter {
 
 func (m *Meter) run() {
 	defer close(m.done)
-	for r := range m.ch {
-		for _, s := range m.sinks {
-			s.Write(r)
+	for {
+		select {
+		case r := <-m.ch:
+			m.write(r)
+		case <-m.stop:
+			// Drain what is already queued before exiting. Records for requests
+			// that were in flight when shutdown began are already in the buffer,
+			// and discarding them would silently undercount the last few seconds
+			// of the ledger on every deploy.
+			for {
+				select {
+				case r := <-m.ch:
+					m.write(r)
+				default:
+					return
+				}
+			}
 		}
-		m.written.Add(1)
 	}
+}
+
+func (m *Meter) write(r Record) {
+	for _, s := range m.sinks {
+		s.Write(r)
+	}
+	m.written.Add(1)
 }
 
 // Record queues a record, dropping it if the buffer is full.
@@ -73,6 +107,13 @@ func (m *Meter) run() {
 // never silent.
 func (m *Meter) Record(r Record) {
 	if m == nil {
+		return
+	}
+	if m.closed.Load() {
+		// Recorded after shutdown drained. The request still completed — that is
+		// the point — and its ledger entry is counted as dropped rather than
+		// silently discarded.
+		m.dropped.Add(1)
 		return
 	}
 	if r.At.IsZero() {
@@ -114,7 +155,10 @@ func (m *Meter) Close(ctx context.Context) error {
 	if m == nil {
 		return nil
 	}
-	m.stopOnce.Do(func() { close(m.ch) })
+	m.stopOnce.Do(func() {
+		m.closed.Store(true)
+		close(m.stop)
+	})
 
 	select {
 	case <-m.done:

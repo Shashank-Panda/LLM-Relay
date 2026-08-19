@@ -1,0 +1,139 @@
+# Relay eval suite — coding and tool use.
+#
+# This is what replaces an operator's guess at `quality.coding` with a number
+# somebody can recompute. ADR-0009 is explicit that asserted scores are fine for
+# a self-hosted gateway and not sufficient to promise a paying customer their
+# output will not degrade; running this is the first of the three replacements
+# that ADR describes.
+#
+#   go run ./cmd/relay-eval -suite config/eval/coding.yaml \
+#     -endpoints openai/gpt-4o-mini@us-east,anthropic/claude-sonnet-5@us-east
+#
+# It calls real providers and costs real money. -dry-run prints the call count
+# first.
+#
+# Every expectation below is objective: a substring, a pattern, a tool argument,
+# a JSON path. Nothing here is a judgement call, which is what lets the resulting
+# score be quoted to a customer who wants to check it. No model grades another
+# model — see the package doc for why that holds even offline.
+
+name: coding-and-tools
+
+# Three runs per case, so the score distinguishes "gets it right" from "gets it
+# right most of the time". A model that passes two runs in three is a different
+# proposition from one that always passes, and one run cannot tell them apart.
+repeats: 3
+
+# Zero, to measure the model rather than its sampling.
+temperature: 0.0
+
+cases:
+  # --- coding ---
+
+  - id: fizzbuzz-python
+    dimension: coding
+    prompt: |
+      Write a Python function called fizzbuzz(n) that returns a list of strings
+      for 1..n with the usual FizzBuzz rules. Return only the code.
+    max_tokens: 400
+    expect:
+      contains: ["def fizzbuzz", "Fizz", "Buzz", "%"]
+      not_contains: ["I cannot", "as an AI"]
+
+  - id: sql-injection-fix
+    dimension: coding
+    # A case with a specific right answer that a plausible wrong answer misses:
+    # escaping the string is the common incorrect fix, parameterising is correct.
+    prompt: |
+      This Python is vulnerable:
+
+          cur.execute("SELECT * FROM users WHERE email = '" + email + "'")
+
+      Rewrite the single line to be safe. Return only the corrected line.
+    max_tokens: 200
+    expect:
+      regex: ['\?|%s|:\w+']
+      not_contains: ["escape(", "replace("]
+
+  - id: off-by-one
+    dimension: coding
+    weight: 2 # a reading-comprehension failure here is worse than a stylistic one
+    prompt: |
+      What is wrong with this Go loop, in one sentence?
+
+          for i := 0; i <= len(xs); i++ { total += xs[i] }
+    max_tokens: 200
+    expect:
+      regex: ['(?i)(out of range|off[- ]by[- ]one|<=|bounds)']
+
+  # --- structured output ---
+
+  - id: json-extraction
+    dimension: structured
+    prompt: |
+      Extract the person's details from this sentence as JSON with keys
+      "name", "age", and "city":
+      "Dana Okoro is 34 and lives in Lagos."
+    response_format: json_object
+    max_tokens: 200
+    expect:
+      json_path:
+        name: Dana Okoro
+        age: "34"
+        city: Lagos
+
+  - id: json-schema-adherence
+    dimension: structured
+    prompt: Summarise the sentiment of "the flight was delayed four hours".
+    response_format: json_schema
+    max_tokens: 200
+    schema: |
+      {
+        "type": "object",
+        "properties": {
+          "sentiment": {"type": "string", "enum": ["positive", "negative", "neutral"]},
+          "confidence": {"type": "number"}
+        },
+        "required": ["sentiment", "confidence"],
+        "additionalProperties": false
+      }
+    expect:
+      json_path:
+        sentiment: negative
+
+  # --- tool use ---
+
+  - id: tool-single-call
+    dimension: tools
+    prompt: What is the weather in Reykjavik right now?
+    max_tokens: 300
+    tools:
+      - name: get_weather
+        description: Current weather for a city.
+        schema: |
+          {
+            "type": "object",
+            "properties": {
+              "city": {"type": "string"},
+              "unit": {"type": "string", "enum": ["c", "f"]}
+            },
+            "required": ["city"]
+          }
+    expect:
+      calls_tool: get_weather
+      tool_args:
+        city: Reykjavik
+
+  - id: tool-restraint
+    dimension: tools
+    # The harder half of tool use, and the one cheap models fail: knowing when
+    # *not* to call. A model that reaches for the tool on every prompt scores
+    # perfectly on the case above and is unusable in practice.
+    prompt: What is 17 multiplied by 3?
+    max_tokens: 200
+    tools:
+      - name: get_weather
+        description: Current weather for a city.
+        schema: '{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}'
+    expect:
+      contains: ["51"]

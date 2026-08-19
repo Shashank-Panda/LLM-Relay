@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Shashank-Panda/relay/internal/admit"
 	"github.com/Shashank-Panda/relay/internal/catalog"
 	"github.com/Shashank-Panda/relay/internal/gateway"
 	"github.com/Shashank-Panda/relay/internal/meter"
@@ -43,6 +44,11 @@ type Options struct {
 
 	// Metrics is the Prometheus instrumentation. Nil disables it.
 	Metrics *metrics.Metrics
+
+	// Admit bounds concurrent work. Nil admits everything, which is Phase 1's
+	// behaviour: correct for a single-tenant test deployment and not something
+	// to run in front of production traffic.
+	Admit *admit.Limiter
 }
 
 func DefaultOptions() Options {
@@ -65,6 +71,7 @@ type Server struct {
 	tenants *tenant.Registry
 	meter   *meter.Meter
 	metrics *metrics.Metrics
+	admit   *admit.Limiter
 
 	// ready flips to false the instant shutdown begins, so load balancers stop
 	// sending traffic before the socket closes. A process that reports healthy
@@ -87,6 +94,7 @@ func New(gw *gateway.Gateway, store *catalog.Store, registry *provider.Registry,
 		tenants: opts.Tenants,
 		meter:   opts.Meter,
 		metrics: opts.Metrics,
+		admit:   opts.Admit,
 	}
 	s.ready.Store(true)
 	return s

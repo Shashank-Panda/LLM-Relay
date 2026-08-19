@@ -91,6 +91,53 @@ type Record struct {
 	// rather than working (ADR-0008).
 	FinishReason string `json:"finish_reason,omitempty"`
 
+	// Attempts is how many provider calls this request made, Retries how many
+	// repeated an endpoint, and Failovers how many endpoints were abandoned.
+	//
+	// All three are cost figures before they are reliability figures. Every
+	// attempt past the first is a second charge for one answer, so a rising
+	// retry rate shows up on an invoice before it shows up on an error
+	// dashboard — and the ledger is where those two facts can be read together.
+	Attempts  int `json:"attempts,omitempty"`
+	Retries   int `json:"retries,omitempty"`
+	Failovers int `json:"failovers,omitempty"`
+
+	// Rerouted records that a provider rejected the request on a constraint the
+	// router had wrong, and the router was re-run with it corrected. A rising
+	// rate means the token estimate is systematically off for some traffic
+	// shape, which is a fixable modelling problem rather than a provider one.
+	Rerouted bool `json:"rerouted,omitempty"`
+
+	// Escalated marks a request where a downgraded endpoint produced invalid
+	// output and the baseline was retried (ADR-0009).
+	//
+	// The fields beside it are what make the escalation honest rather than
+	// merely recorded. DiscardedCost is the money spent on the answer that was
+	// thrown away, and it is included in Cost — so an escalated request has a
+	// *negative* Saved, which is the correct arithmetic and the uncomfortable
+	// one. A savings ledger that excluded its own failures would be measuring
+	// the wrong thing.
+	Escalated       bool         `json:"escalated,omitempty"`
+	EscalatedFrom   string       `json:"escalated_from,omitempty"`
+	EscalationCause string       `json:"escalation_cause,omitempty"`
+	DiscardedCost   domain.Money `json:"discarded_cost_micros,omitempty"`
+
+	// EscalationRecovered is whether the baseline's answer passed the same check
+	// the downgrade failed. False means a second call was bought and the output
+	// is still invalid, which says something about the request rather than about
+	// the endpoint.
+	EscalationRecovered bool `json:"escalation_recovered,omitempty"`
+
+	// StreamFailedAfterTTFT marks a stream that broke after the client had
+	// already received content.
+	//
+	// Its own field rather than an error class, because it is the one failure
+	// ADR-0003 knowingly does not cover: past the first byte no failover is
+	// honest, so this is the residual risk of that decision. The ADR says it
+	// gets revisited with data if the gap turns out to be larger than expected,
+	// and this is the data.
+	StreamFailedAfterTTFT bool `json:"stream_failed_after_ttft,omitempty"`
+
 	InputTokens       int  `json:"input_tokens"`
 	CachedInputTokens int  `json:"cached_input_tokens,omitempty"`
 	OutputTokens      int  `json:"output_tokens"`

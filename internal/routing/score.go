@@ -63,7 +63,12 @@ func score(cands []candidate, req *domain.Request, rt *domain.Route) []domain.Sc
 					reasons = append(reasons, "session affinity from previous turn")
 				}
 			case strings.HasPrefix(d, domain.DimQualityPrefix):
-				norm = c.ep.QualityFor(strings.TrimPrefix(d, domain.DimQualityPrefix))
+				// The effective score, so that an endpoint whose output keeps
+				// failing validity checks also ranks lower rather than merely
+				// clearing the floor by a hair. The floor removes the
+				// unacceptable; this makes the ranking follow reality.
+				dim := strings.TrimPrefix(d, domain.DimQualityPrefix)
+				norm = c.health.EffectiveQuality(c.ep.QualityFor(dim))
 			}
 
 			contribution := w * norm
@@ -128,7 +133,10 @@ func rank(scored []domain.ScoredCandidate, cands []candidate, rt *domain.Route) 
 	quality := make(map[string]float64, len(cands))
 	if dim := rt.QualityDim(); dim != "" {
 		for _, c := range cands {
-			quality[c.ep.ID] = c.ep.QualityFor(dim)
+			// Effective, matching the scorer. A tie broken on the asserted score
+			// while the totals were computed from the effective one would break
+			// ties by a number that decided nothing else.
+			quality[c.ep.ID] = c.health.EffectiveQuality(c.ep.QualityFor(dim))
 		}
 	}
 

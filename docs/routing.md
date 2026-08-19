@@ -39,6 +39,19 @@ The resolution is that substitution is a **consented, disclosed, bounded** trans
 - **`X-Relay-Pin: strict`** escapes it per request, unconditionally.
 - **Shadow mode** is the intermediate setting: route and price the counterfactual, record the saving that *would* have occurred, but serve the baseline. Nothing changes for the caller except a header.
 
+### Failover is not substitution
+
+Retrying elsewhere changes which endpoint answers, which looks like the thing the paragraphs above forbid doing silently. It is not, and the difference is that an endpoint is a `(model, deployment, credential)` triple:
+
+| Mode | May fail over to |
+|---|---|
+| `strict`, `shadow` | Endpoints running the **same model** — another deployment, another credential. The model that answers is the one the caller named. |
+| `optimize` | The ranked candidates, since permission to choose among them was already granted. |
+
+So a strict tenant whose `us-east` deployment is down is served the same model from `eu-west` rather than an error, and is never quietly moved to a cheaper model during exactly the incident where they are least able to notice. The two outcomes are disclosed differently: `X-Relay-Failover: true` means a different endpoint ran the same model, and `X-Relay-Substituted: true` means a different model answered. Conflating them would report a regional recovery as a downgrade, and would put it in the substitutions figure on a savings report.
+
+The permitted set is computed by the router and recorded on the `Decision` rather than derived by the executor — a decision's failover options are part of why it was made, and the executor should be reading a plan rather than inventing one mid-incident.
+
 The distinction that keeps this honest: the caller has agreed, in advance and in configuration, that "the model I named" means "at most this model, and something cheaper when it demonstrably suffices." Under that agreement a downgrade is the service working, not a lie. Without the agreement — or with the swap concealed — it would be a lie, which is why neither is available. See [ADR-0007](adr/0007-requested-model-as-baseline.md).
 
 Relay-specific options that have no place in the OpenAI schema (session key, dry-run, strict pin, weight overrides) travel as `X-Relay-*` headers or inside `extra_body`, so that an unmodified SDK never has to know they exist.
@@ -228,6 +241,14 @@ Three properties keep this from becoming a cost problem of its own:
 - **Escalation rate is the feedback signal.** Sustained escalation on a route means the downgrade was wrong; the endpoint's effective quality is revised down, and routing stops choosing it. The system corrects itself without waiting for a human to notice the bill.
 
 Escalation is only available where a validity check is cheap and objective. It cannot detect an answer that is merely *worse* — only one that is *invalid*. That limit is real, and it is why the quality floor exists as a separate, upstream mechanism rather than relying on cascade alone.
+
+**As built.** The checks are: an empty completion (a pure tool call is not empty — it is the answer), a `json_object` body that does not parse, a `json_schema` violation over a documented subset of the specification, tool arguments that do not parse or that name an undeclared tool, and `finish_reason: content_filter`. Refusal *phrasing* is deliberately not matched: it is locale-specific, defeated by paraphrase, and would fire on the correct answer to "what should I say when I have to decline a request".
+
+One rule governs all of them — **when in doubt, valid** — because the two failure directions are not symmetric. A missed violation costs nothing; a false alarm buys a second provider call for output that was fine. Anything a check cannot prove, it declines to judge.
+
+Escalation applies to non-streaming requests only. The checks that matter need the complete response, and by the time one exists on a stream the client has already received most of it ([ADR-0003](adr/0003-streaming-failover-semantics.md)).
+
+The rate feeds back as a quality penalty on the endpoint that failed, subtracted from its asserted catalog score before the floor is applied and before it is scored. That is what makes the loop close: an over-optimistic score corrects itself, and `/health` reports the revision so an operator asking why a route stopped selecting an endpoint gets an answer rather than an inference.
 
 ---
 

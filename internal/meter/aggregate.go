@@ -72,6 +72,51 @@ type Totals struct {
 	// ceiling. A ceiling that fires regularly is wrong and should be raised —
 	// which is only knowable if it is counted (ADR-0008).
 	Truncated int64 `json:"truncated_responses"`
+
+	// Attempts, Retries, and Failovers are reliability figures that are also
+	// cost figures, which is why they belong in a savings report rather than
+	// only on a dashboard. Every attempt past the first is a second charge for
+	// one answer, so a retry storm shows up here as spend with no corresponding
+	// output — and that is a number somebody reviewing an invoice needs.
+	Attempts  int64 `json:"attempts"`
+	Retries   int64 `json:"retries"`
+	Failovers int64 `json:"failovers"`
+	Reroutes  int64 `json:"reroutes"`
+
+	// StreamFailuresAfterTTFT counts streams that broke after the client had
+	// received content — the failure ADR-0003 knowingly does not cover, kept
+	// visible so the size of that gap is measured rather than assumed.
+	StreamFailuresAfterTTFT int64 `json:"stream_failures_after_ttft"`
+
+	// Escalations counts downgrades whose output failed a validity check and
+	// were retried on the baseline, and DiscardedCost is what those abandoned
+	// answers cost.
+	//
+	// DiscardedCost is already inside Cost — it is not an extra to be added, it
+	// is the part of the spend that bought nothing. Reported separately because
+	// "we spent this and threw it away" is the number that says whether the
+	// downgrades are worth making, and it is invisible inside a total.
+	Escalations          int64        `json:"escalations"`
+	EscalationsRecovered int64        `json:"escalations_recovered"`
+	DiscardedCost        domain.Money `json:"discarded_cost_micros"`
+
+	// Substitutable counts requests where something *could* have been
+	// downgraded, which is the denominator the 2% escalation SLO is measured
+	// against. Against total requests the rate would be diluted by every strict
+	// request that was never eligible.
+	Substitutable int64 `json:"substitutable_requests"`
+}
+
+// EscalationRate is escalations over the requests that were eligible for one.
+//
+// ADR-0009 sets the SLO at under 2% per route. Measured against substitutable
+// requests rather than all of them: a tenant running mostly strict traffic would
+// otherwise show a rate near zero however badly their downgrades were doing.
+func (t Totals) EscalationRate() float64 {
+	if t.Substitutable <= 0 {
+		return 0
+	}
+	return float64(t.Escalations) / float64(t.Substitutable)
 }
 
 // CachedInputShare is the fraction of input tokens the provider reported as
@@ -99,6 +144,29 @@ func (t *Totals) add(r Record) {
 	}
 	if r.FinishReason == string(provider.FinishLength) {
 		t.Truncated++
+	}
+
+	t.Attempts += int64(r.Attempts)
+	t.Retries += int64(r.Retries)
+	t.Failovers += int64(r.Failovers)
+	if r.Rerouted {
+		t.Reroutes++
+	}
+	if r.StreamFailedAfterTTFT {
+		t.StreamFailuresAfterTTFT++
+	}
+	if r.Substituted || r.Escalated {
+		// Escalated requests count as substitutable even though Endpoint now
+		// names the baseline: something *was* downgraded, and the escalation is
+		// the evidence.
+		t.Substitutable++
+	}
+	if r.Escalated {
+		t.Escalations++
+		t.DiscardedCost += r.DiscardedCost
+		if r.EscalationRecovered {
+			t.EscalationsRecovered++
+		}
 	}
 
 	if r.CacheHit {
@@ -281,6 +349,19 @@ func noteFor(t Totals) string {
 		return "breakpoints_inserted is above zero while cached_input_tokens is zero: markers " +
 			"were placed and the provider cached none of them. Inserted is effort; " +
 			"cached_input_tokens is effect."
+	case t.Escalations > 0:
+		// The most counter-intuitive line in the report, so it is stated rather
+		// than left to be worked out: an escalated request cost more than not
+		// optimizing would have, and saved_micros is lower because of it.
+		return "escalated requests paid for two answers and used one. discarded_cost_micros " +
+			"is already included in cost_micros and has reduced saved_micros accordingly — " +
+			"a savings figure that excluded its own failures would not be a measurement."
+	case t.Retries+t.Failovers > 0:
+		// Stated because the obvious reading of a cost total is "what the
+		// answers cost", and retried attempts are charges with no answer
+		// attached to them.
+		return "retries and failovers are additional provider calls; their cost is included " +
+			"in cost_micros but produced no extra output."
 	case t.CacheHits > 0:
 		return "cache_hit_tokens_avoided is not included in input_tokens or output_tokens; " +
 			"those count tokens actually purchased."

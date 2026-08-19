@@ -129,11 +129,18 @@ func TestPrepareFailures(t *testing.T) {
 					if !strings.Contains(err.Error(), tc.wantIn) {
 						t.Errorf("err = %q, want it to mention %q", err, tc.wantIn)
 					}
-					if got := provider.ClassOf(err); got != provider.ClassTerminal {
-						t.Errorf("class = %s, want Terminal — retrying this cannot help", got)
+					// RetryOther, not Terminal. Retrying *this* endpoint cannot
+					// help — a missing adapter or credential fails identically
+					// on the next attempt — but the request itself is fine, so
+					// the next candidate in the ranking may well serve it. That
+					// is the difference between the two classes, and getting it
+					// wrong here turns one misconfigured endpoint into an
+					// outage for every route that lists it.
+					if got := provider.ClassOf(err); got != provider.ClassRetryOther {
+						t.Errorf("class = %s, want RetryOther — the endpoint is unusable, the request is not", got)
 					}
-					if att.Class != provider.ClassTerminal {
-						t.Errorf("attempt class = %s, want Terminal", att.Class)
+					if att.Class != provider.ClassRetryOther {
+						t.Errorf("attempt class = %s, want RetryOther", att.Class)
 					}
 					// The endpoint is recorded even on failure, or the log line
 					// cannot say which endpoint failed.

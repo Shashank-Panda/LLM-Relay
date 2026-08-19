@@ -73,10 +73,15 @@ func filter(c filterCtx, ids []string, cat *domain.Catalog) ([]candidate, []doma
 			continue
 		}
 
+		// Read once and reused: the health snapshot supplies the circuit state,
+		// the latency estimate the scorer will need, and the quality penalty
+		// that several checks below apply.
+		h := c.health.For(id)
+
 		// Route-level requirements are the route author's own hard constraints,
 		// checked before tenant policy so a misconfigured route reports as a
 		// route problem rather than as a policy denial.
-		if detail, ok := satisfiesRequirements(ep, c.route.Require); !ok {
+		if detail, ok := satisfiesRequirements(ep, h, c.route.Require); !ok {
 			reject(id, requirementReason(detail), detail.msg)
 			continue
 		}
@@ -105,9 +110,16 @@ func filter(c filterCtx, ids []string, cat *domain.Catalog) ([]candidate, []doma
 		// across the surviving set, so a weight expresses a preference relative
 		// to whatever else happens to be available — it cannot express a floor.
 		// See ADR-0009.
-		if dim, floor, ok := belowFloor(ep, c.route, c.policy); !ok {
+		if dim, floor, ok := belowFloor(ep, h, c.route, c.policy); !ok {
+			// The effective score is reported, not the asserted one, with the
+			// penalty spelled out beside it. An operator reading "quality.coding
+			// is 0.85, floor is 0.80" next to a rejection would conclude the
+			// filter was broken; the number that actually decided is the one
+			// observation produced.
 			reject(id, domain.RejectBelowQualityFloor, fmt.Sprintf(
-				"quality.%s is %.2f, floor is %.2f", dim, ep.QualityFor(dim), floor))
+				"quality.%s is %.2f (asserted %.2f, observed penalty %.2f), floor is %.2f",
+				dim, h.EffectiveQuality(ep.QualityFor(dim)), ep.QualityFor(dim),
+				h.QualityPenalty, floor))
 			continue
 		}
 
@@ -117,7 +129,6 @@ func filter(c filterCtx, ids []string, cat *domain.Catalog) ([]candidate, []doma
 			continue
 		}
 
-		h := c.health.For(id)
 		if h.CircuitOpen {
 			reject(id, domain.RejectCircuitOpen, "circuit breaker is open")
 			continue
@@ -141,7 +152,9 @@ func requirementReason(f requirementFailure) domain.RejectReason {
 	return domain.RejectBelowQualityFloor
 }
 
-func satisfiesRequirements(ep *domain.ModelEndpoint, reqs []domain.Constraint) (requirementFailure, bool) {
+func satisfiesRequirements(
+	ep *domain.ModelEndpoint, h domain.EndpointHealth, reqs []domain.Constraint,
+) (requirementFailure, bool) {
 	for _, r := range reqs {
 		if r.Capability != "" && !hasCapability(ep, r.Capability) {
 			return requirementFailure{
@@ -149,11 +162,17 @@ func satisfiesRequirements(ep *domain.ModelEndpoint, reqs []domain.Constraint) (
 				msg:        "route requires " + r.Capability,
 			}, false
 		}
-		if r.QualityDim != "" && ep.QualityFor(r.QualityDim) < r.QualityMin {
-			return requirementFailure{
-				msg: fmt.Sprintf("route requires quality.%s >= %.2f, endpoint is %.2f",
-					r.QualityDim, r.QualityMin, ep.QualityFor(r.QualityDim)),
-			}, false
+		// The route's own quality requirement is checked against the effective
+		// score for the same reason the tenant floor is: an asserted score that
+		// observation has contradicted is not the number to decide on.
+		if r.QualityDim != "" {
+			q := h.EffectiveQuality(ep.QualityFor(r.QualityDim))
+			if q < r.QualityMin {
+				return requirementFailure{
+					msg: fmt.Sprintf("route requires quality.%s >= %.2f, endpoint is %.2f",
+						r.QualityDim, r.QualityMin, q),
+				}, false
+			}
 		}
 	}
 	return requirementFailure{}, true
@@ -181,7 +200,9 @@ func hasCapability(ep *domain.ModelEndpoint, name string) bool {
 // route actually ranks on. A floor for a dimension the route never scores is
 // not applied — a coding floor should not eliminate candidates on a
 // summarization route, where the score means something else entirely.
-func belowFloor(ep *domain.ModelEndpoint, rt *domain.Route, pol *domain.Policy) (dim string, floor float64, ok bool) {
+func belowFloor(
+	ep *domain.ModelEndpoint, h domain.EndpointHealth, rt *domain.Route, pol *domain.Policy,
+) (dim string, floor float64, ok bool) {
 	if pol == nil || len(pol.QualityFloor) == 0 {
 		return "", 0, true
 	}
@@ -191,7 +212,12 @@ func belowFloor(ep *domain.ModelEndpoint, rt *domain.Route, pol *domain.Policy) 
 			continue
 		}
 		f := pol.Floor(d)
-		if f > 0 && ep.QualityFor(d) < f {
+		// Measured against the effective score, which is what closes ADR-0009's
+		// loop. The floor exists because catalog scores are operator assertions
+		// and assertions can be optimistic; applying it to the unadjusted
+		// assertion would leave the floor trusting precisely the number that
+		// observation has shown to be wrong.
+		if f > 0 && h.EffectiveQuality(ep.QualityFor(d)) < f {
 			return d, f, false
 		}
 	}
