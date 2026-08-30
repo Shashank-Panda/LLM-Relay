@@ -14,6 +14,8 @@ package routing
 
 import (
 	"errors"
+	"sort"
+	"strings"
 
 	"github.com/Shashank-Panda/relay/internal/domain"
 )
@@ -26,8 +28,79 @@ var (
 	// ErrNoCandidate means filtering eliminated everything and there was no
 	// fallback and no baseline to fall back to. The caller cannot serve this
 	// request at all.
+	//
+	// Prefer errors.Is over comparison: the router returns a *NoCandidateError
+	// carrying the rejections, and that type reports as this sentinel.
 	ErrNoCandidate = errors.New("routing: no viable candidate and no fallback")
 )
+
+// NoCandidateError is ErrNoCandidate with the reasons attached.
+//
+// The bare sentinel was returned as a flat 503 saying only that nothing could
+// serve the request, which is unactionable — and under BYOK the overwhelmingly
+// common cause is "you sent no key", which is a caller problem fixable in one
+// header rather than a server problem to wait out. The rejections are already
+// computed; the only thing missing was carrying them far enough to be reported.
+type NoCandidateError struct {
+	Rejected []domain.RejectedCandidate
+}
+
+func (e *NoCandidateError) Error() string {
+	if len(e.Rejected) == 0 {
+		return ErrNoCandidate.Error()
+	}
+	reasons := make([]string, 0, len(e.Rejected))
+	seen := map[domain.RejectReason]bool{}
+	for _, r := range e.Rejected {
+		if !seen[r.Reason] {
+			seen[r.Reason] = true
+			reasons = append(reasons, string(r.Reason))
+		}
+	}
+	sort.Strings(reasons)
+	return ErrNoCandidate.Error() + " (" + strings.Join(reasons, ", ") + ")"
+}
+
+// Is makes errors.Is(err, ErrNoCandidate) keep working, so adding this type
+// changed no existing call site.
+func (e *NoCandidateError) Is(target error) bool { return target == ErrNoCandidate }
+
+// AllRejectedFor reports whether every rejection has this reason, and there was
+// at least one.
+//
+// "Every" rather than "any" on purpose: a request where one endpoint lacked a
+// credential and the rest failed a quality floor is not a credentials problem,
+// and telling the caller to send a key would send them after the wrong thing.
+func (e *NoCandidateError) AllRejectedFor(reason domain.RejectReason) bool {
+	if len(e.Rejected) == 0 {
+		return false
+	}
+	for _, r := range e.Rejected {
+		if r.Reason != reason {
+			return false
+		}
+	}
+	return true
+}
+
+// MissingRefs lists the credential refs named by NoCredential rejections.
+func (e *NoCandidateError) MissingRefs(cat *domain.Catalog) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range e.Rejected {
+		if r.Reason != domain.RejectNoCredential || cat == nil {
+			continue
+		}
+		ep, ok := cat.Endpoint(r.EndpointID)
+		if !ok || ep.CredentialRef == "" || seen[ep.CredentialRef] {
+			continue
+		}
+		seen[ep.CredentialRef] = true
+		out = append(out, ep.CredentialRef)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // Input is everything Route is allowed to look at.
 type Input struct {
@@ -35,6 +108,11 @@ type Input struct {
 	Catalog *domain.Catalog
 	Policy  *domain.Policy
 	Health  *domain.Health
+
+	// Credentials is which credential refs the caller can actually use, taken
+	// as a snapshot outside so this function stays pure. Nil has no opinion and
+	// keeps every candidate.
+	Credentials *domain.CredentialSet
 }
 
 // Route selects an endpoint and explains why.
@@ -72,7 +150,7 @@ func Route(in Input) (*domain.Decision, error) {
 		// caller's outage. Degrade to the baseline where one exists; only fail
 		// when there is genuinely nothing to serve. See ADR-0010.
 		if !hasBaseline {
-			return nil, ErrNoCandidate
+			return nil, &NoCandidateError{}
 		}
 		d.UsedFallback = true
 		serveBaseline(d, baseline, baselineCost, "route not found; served baseline")
@@ -91,7 +169,8 @@ func Route(in Input) (*domain.Decision, error) {
 
 	fc := filterCtx{
 		req: req, route: rt, policy: pol, health: in.Health,
-		mode: mode, baselineCost: baselineCost, hasBaseline: hasBaseline,
+		creds: in.Credentials,
+		mode:  mode, baselineCost: baselineCost, hasBaseline: hasBaseline,
 	}
 	kept, rejected := filter(fc, candidateIDs(rt, req.Baseline.EndpointID), cat)
 	d.Rejected = rejected
@@ -253,7 +332,7 @@ func serveFallback(
 		return d, nil
 	}
 
-	return nil, ErrNoCandidate
+	return nil, &NoCandidateError{Rejected: d.Rejected}
 }
 
 // serveBaseline records a decision to serve exactly what the caller asked for.

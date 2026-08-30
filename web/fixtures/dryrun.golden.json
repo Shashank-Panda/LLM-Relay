@@ -1,0 +1,98 @@
+{
+  "baseline": "anthropic/claude-opus-5@us-east",
+  "cache": {
+    "eligible": false,
+    "skipped_because": "route does not enable the response cache"
+  },
+  "catalog_version": "2026-08-04.1",
+  "chosen": "openai/gpt-4o-mini@us-east",
+  "credentials": {
+    "assumed": true,
+    "available": [
+      "local"
+    ],
+    "missing": [
+      "anthropic-primary",
+      "google-primary",
+      "openai-primary"
+    ]
+  },
+  "estimate": {
+    "cache_breakpoints": 0,
+    "estimated_baseline_cost_usd": 0.40965,
+    "estimated_cost_usd": 0.009831,
+    "estimated_saved_usd": 0.399819,
+    "expected_output_tokens": 16384,
+    "input_tokens_after": 10,
+    "input_tokens_before": 10,
+    "max_output_tokens": 16384,
+    "saving_measured": true
+  },
+  "mode": "optimize",
+  "note": "Estimates only. No provider was called and nothing was recorded. Output length cannot be known before generation, so every figure here is priced against an expected output count; the ledger prices the same request against reported actuals.",
+  "object": "relay.dry_run",
+  "optimizations": [],
+  "optimizer": {
+    "budget_us": 3000,
+    "elapsed_us": 0,
+    "outcome": "applied"
+  },
+  "policy_version": "file",
+  "ranked": [
+    {
+      "components": {
+        "cache_affinity": 0,
+        "cost": 0.3,
+        "latency": 0.2,
+        "quality.coding": 0.248
+      },
+      "endpoint": "openai/gpt-4o-mini@us-east",
+      "estimated_cost_usd": 0.009831,
+      "total": 0.748
+    },
+    {
+      "components": {
+        "cache_affinity": 0,
+        "cost": 0.18442595274361648,
+        "latency": 0.2,
+        "quality.coding": 0.35200000000000004
+      },
+      "endpoint": "anthropic/claude-sonnet-5@us-east",
+      "estimated_cost_usd": 0.16386,
+      "total": 0.736
+    },
+    {
+      "components": {
+        "cache_affinity": 0,
+        "cost": 0.276640429794482,
+        "latency": 0.2,
+        "quality.coding": 0.24
+      },
+      "endpoint": "google/gemini-flash@us-central",
+      "estimated_cost_usd": 0.040963,
+      "total": 0.717
+    },
+    {
+      "components": {
+        "cache_affinity": 0,
+        "cost": 0,
+        "latency": 0.2,
+        "quality.coding": 0.38
+      },
+      "endpoint": "anthropic/claude-opus-5@us-east",
+      "estimated_cost_usd": 0.40965,
+      "total": 0.58
+    }
+  ],
+  "rejected": [
+    {
+      "detail": "route requires tools",
+      "endpoint": "ollama/qwen-coder@local",
+      "reason": "MissingCapability"
+    }
+  ],
+  "requested_model": "relay/fast-coder",
+  "route": "relay/fast-coder",
+  "substituted": true,
+  "tenant": "demo"
+}

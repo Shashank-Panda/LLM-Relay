@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    # Windows is in the matrix because it is where this code is written, and
+    # because the two places most likely to differ — the ledger's MkdirAll and
+    # the catalog loader's path handling — are both on the startup path, where a
+    # failure means the process never listens at all.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          unformatted=$(gofmt -l cmd internal)
+          if [ -n "$unformatted" ]; then
+            echo "unformatted files:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test ./...
+
+      # -race needs cgo, so it runs where a C toolchain is present. Paired with
+      # the goleak assertions on the streaming tests, this is the combination
+      # that catches the concurrency bugs in the stream path.
+      - name: go test -race
+        if: matrix.os == 'ubuntu-latest'
+        run: go test -race ./...
+
+      # Loads the shipped catalog and tenants without binding a port. Catches a
+      # config file that no unit test happens to read.
+      - name: validate shipped config
+        run: go run ./cmd/relay -validate
+
+  console:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run lint
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - run: npm test
+        working-directory: web
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Built, not pushed: there is no registry decision on the record yet.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

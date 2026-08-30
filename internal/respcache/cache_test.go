@@ -22,7 +22,7 @@ func req() *domain.NormalizedRequest {
 
 func entry(tenant, endpoint, answer string) *Entry {
 	return &Entry{
-		Tenant:       tenant,
+		Scope:        tenant,
 		Endpoint:     endpoint,
 		Parts:        []domain.ContentPart{text(answer)},
 		FinishReason: provider.FinishStop,
@@ -472,7 +472,7 @@ func TestRoundTripThroughTheStore(t *testing.T) {
 		usage:  &provider.Usage{InputTokens: 4, OutputTokens: 1},
 	}
 	st := Record(src, func(p []domain.ContentPart, f provider.FinishReason, u provider.Usage) {
-		s.Put("k", &Entry{Tenant: "t", Endpoint: "ep", Parts: p, FinishReason: f, Usage: u}, time.Minute)
+		s.Put("k", &Entry{Scope: "t", Endpoint: "ep", Parts: p, FinishReason: f, Usage: u}, time.Minute)
 	})
 	drain(t, st)
 

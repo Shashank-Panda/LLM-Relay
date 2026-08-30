@@ -47,6 +47,20 @@ const (
 	HeaderSaved          = "X-Relay-Saved-Usd"
 	HeaderSavedEstimated = "X-Relay-Saved-Estimated"
 
+	// HeaderCost and HeaderBaselineCost are the two numbers HeaderSaved is the
+	// difference of.
+	//
+	// Emitted together with it and under exactly the same conditions, because a
+	// saving without its operands is a claim rather than a measurement — the
+	// caller cannot check the subtraction, and checking it is the entire reason
+	// this product reports both costs on every request. HeaderSavedEstimated
+	// qualifies all three at once: on a stream they are pre-flight estimates.
+	//
+	// HeaderCost is zero on a response-cache hit. No tokens were bought, so the
+	// honest cost is nothing and the whole baseline is the saving.
+	HeaderCost         = "X-Relay-Cost-Usd"
+	HeaderBaselineCost = "X-Relay-Baseline-Usd"
+
 	// HeaderShadowSaved is what optimize mode would have saved. Present only in
 	// shadow mode, and never merged with HeaderSaved: one is money saved, the
 	// other is money that could have been.
@@ -70,6 +84,32 @@ const (
 	// the OpenAI schema and adding to it would break client libraries — the same
 	// constraint that makes the model string carry routing intent.
 	HeaderNoCache = "X-Relay-No-Cache"
+
+	// HeaderCredential carries one caller-supplied provider key, as
+	// "<credential_ref> <secret>". Repeatable: send it once per ref.
+	//
+	// Distinct from Authorization, which is a *Relay tenant* key and not a
+	// provider key. The two authenticate different things to different parties
+	// and are never interchangeable.
+	//
+	// A key arriving this way is used for this request and is never stored,
+	// never cached, never logged, and never written to the savings ledger.
+	HeaderCredential = "X-Relay-Credential"
+
+	// HeaderAssumeCredentials makes a DRY RUN reason about routing as though
+	// every credential in the catalog were configured.
+	//
+	// It exists so the explanation is legible on a machine holding no keys —
+	// which is every machine that has just cloned this repository, and the
+	// audience the explanation is most valuable to. Without it, the moment
+	// routing began eliminating endpoints for want of a credential, a keyless
+	// dry run would collapse from a full ranking to a single row and stop
+	// demonstrating anything.
+	//
+	// Honoured only on a dry run, and ignored everywhere else. A live request
+	// that could be talked into routing to an endpoint Relay cannot
+	// authenticate to would be a denial of service with a polite name.
+	HeaderAssumeCredentials = "X-Relay-Assume-Credentials"
 
 	// HeaderDryRun asks what Relay would do, without doing it. Answered with the
 	// full decision and the optimizations, and no provider is contacted.
@@ -148,9 +188,46 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		req.NoCache = true
 	}
 
-	prepared, err := s.gw.Prepare(req, tn, body.Model, r.Header.Get(HeaderPin))
+	// A dry run may be asked to reason as though every credential existed, so
+	// that the routing arithmetic is visible on a machine holding no keys. The
+	// gate is here, in the handler, and not in the gateway: a live request that
+	// could be talked into routing to an endpoint Relay cannot authenticate to
+	// would turn an explanation feature into a self-inflicted outage.
+	dry := truthy(r.Header.Get(HeaderDryRun))
+	assume := dry && assumesCredentials(r.Header.Get(HeaderAssumeCredentials))
+
+	keys, err := parseCredentials(r.Header)
 	if err != nil {
-		s.writePrepareError(w, err)
+		wire.WriteError(w, http.StatusBadRequest, err.Error(),
+			wire.TypeInvalidRequest, "invalid_credential_header")
+		return
+	}
+	if keys != nil && insecureCredentials(r, s.opts.AllowInsecureCredentials) {
+		// Refused rather than warned about. The request would otherwise
+		// succeed, so nothing downstream would ever mention that a live
+		// provider key had just crossed the network in the clear.
+		wire.WriteError(w, http.StatusBadRequest,
+			"refusing to accept "+HeaderCredential+" over a plaintext connection; "+
+				"use HTTPS, or start the gateway with -allow-insecure-credentials "+
+				"if this is a local deployment",
+			wire.TypeInvalidRequest, "insecure_credential")
+		return
+	}
+
+	cat := s.store.Current()
+	tid := ""
+	if tn != nil {
+		tid = tn.ID
+	}
+	prepared, err := s.gw.Prepare(req, tn, gateway.PrepareOptions{
+		Model:              body.Model,
+		Pin:                r.Header.Get(HeaderPin),
+		Credentials:        s.gw.CredentialSnapshot(r.Context(), cat, tid, resolverOf(keys)),
+		RequestCredentials: keys,
+		AssumeCredentials:  assume,
+	})
+	if err != nil {
+		s.writePrepareError(w, err, cat)
 		return
 	}
 
@@ -166,7 +243,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.observeOptimize(prepared)
 	s.setDisclosureHeaders(w, prepared)
 
-	if truthy(r.Header.Get(HeaderDryRun)) {
+	if dry {
 		// Answered before any provider contact and before any ledger record:
 		// nothing happened, so nothing is billed and nothing is counted.
 		writeJSON(w, http.StatusOK, dryRun(prepared))
@@ -180,9 +257,48 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.chatCompletion(w, r, prepared, start)
 }
 
+// writeExecuteError reports a provider-call failure, with one special case.
+//
+// A missing credential reaches here rather than writePrepareError whenever
+// routing had *something* to serve — a route fallback, or strict mode, which
+// skips filtering entirely — and only the executor discovered there was no key
+// for it. The resolver's own message is correct but partial: it names the
+// environment variable, which is the right remedy for the operator of a
+// self-hosted install and useless advice to somebody using a hosted console,
+// where the machine holding that environment is not theirs.
+//
+// So the transport's own remedy is added here, in the layer that knows the
+// header exists. This is the most likely first-run failure for anyone who has
+// just started the gateway, and it is worth answering completely.
+func (s *Server) writeExecuteError(w http.ResponseWriter, err error) {
+	var missing *provider.ErrNoCredential
+	if errors.As(err, &missing) {
+		// Built from the credential error itself rather than from err.Error():
+		// the executor's wrapper reports which candidates were tried and how
+		// many attempts it took, which is exactly what an operator wants in a
+		// log and exactly what a caller does not need in front of the one
+		// sentence telling them what to do about it.
+		msg := missing.Error() + "; or send " + HeaderCredential + ": " + missing.Ref + " <key>"
+		wire.WriteError(w, http.StatusUnauthorized, msg,
+			wire.TypeAuthentication, "no_credential")
+		return
+	}
+	wire.WriteProviderError(w, err)
+}
+
+// assumesCredentials reads X-Relay-Assume-Credentials.
+//
+// "all" is the only value that does anything. Spelled as a word rather than a
+// boolean so that the request says what it is asking for, and so "available" —
+// the default — can be written down explicitly by a caller who wants to be sure
+// they are seeing their real candidate set.
+func assumesCredentials(v string) bool {
+	return strings.EqualFold(strings.TrimSpace(v), "all")
+}
+
 // writePrepareError reports a failure that happened before any provider was
 // contacted.
-func (s *Server) writePrepareError(w http.ResponseWriter, err error) {
+func (s *Server) writePrepareError(w http.ResponseWriter, err error, cat *domain.Catalog) {
 	var unknown *gateway.ErrUnknownModel
 	if errors.As(err, &unknown) {
 		body := wire.ErrorResponse{Error: wire.ErrorBody{
@@ -194,6 +310,29 @@ func (s *Server) writePrepareError(w http.ResponseWriter, err error) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(w).Encode(body)
+		return
+	}
+
+	// Every candidate eliminated for want of a credential is a caller problem
+	// with a one-header fix, not a server problem to wait out. Reported as 401
+	// with the missing refs named, because the alternative — the flat 503 below
+	// — is the single most likely first-run experience for someone who has just
+	// started the gateway, and it tells them nothing they can act on.
+	//
+	// "Every", not "any": a request where one endpoint lacked a key and the rest
+	// failed a quality floor is not a credentials problem, and saying so would
+	// send the caller after the wrong thing.
+	var nc *routing.NoCandidateError
+	if errors.As(err, &nc) && nc.AllRejectedFor(domain.RejectNoCredential) {
+		msg := "no provider credential is available for this request"
+		if refs := nc.MissingRefs(cat); len(refs) > 0 {
+			msg += " (missing: " + strings.Join(refs, ", ") + ")"
+		}
+		msg += "; send X-Relay-Credential: <ref> <key>, or set the matching " +
+			"RELAY_CRED_* variable, or use X-Relay-Dry-Run with " +
+			"X-Relay-Assume-Credentials: all to see the routing decision without one"
+		wire.WriteError(w, http.StatusUnauthorized, msg,
+			wire.TypeAuthentication, "no_credential")
 		return
 	}
 
@@ -429,6 +568,8 @@ func (s *Server) setSavingsHeaders(w http.ResponseWriter, rec *meter.Record, est
 	}
 	h := w.Header()
 	h.Set(HeaderSaved, usd(rec.Saved))
+	h.Set(HeaderCost, usd(rec.Cost))
+	h.Set(HeaderBaselineCost, usd(rec.BaselineCost))
 	if estimated {
 		// The caller must be able to tell a measured figure from a pre-flight
 		// one. A dashboard that summed both would be summing guesses.
@@ -459,7 +600,7 @@ func (s *Server) chatCompletion(w http.ResponseWriter, r *http.Request, p *gatew
 		s.record(rec)
 
 		s.logAttempt(r, p, att, nil)
-		wire.WriteProviderError(w, err)
+		s.writeExecuteError(w, err)
 		return
 	}
 
@@ -512,7 +653,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gat
 		s.logAttempt(r, p, att, nil)
 		// Nothing has been written yet, so this is still a normal JSON error
 		// with a real status code. After the first frame it could not be.
-		wire.WriteProviderError(w, err)
+		s.writeExecuteError(w, err)
 		return
 	}
 	defer stream.Close()
@@ -565,9 +706,71 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, p *gat
 		return
 	}
 
+	// Provider chunks arrive on a channel so the loop can also wake on a
+	// heartbeat tick. stream.Recv blocks, and there is no other way to
+	// interleave a blocked read with a timer.
+	//
+	// The goroutine cannot outlive this function. It parks on either Recv or
+	// the send below; recvDone releases the second and the caller's deferred
+	// stream.Close releases the first. Both defers run, and because defers are
+	// LIFO and recvDone is registered last, it is signalled before the stream
+	// is closed rather than after.
+	type recvResult struct {
+		chunk *provider.Chunk
+		err   error
+	}
+	recvCh := make(chan recvResult)
+	recvDone := make(chan struct{})
+	defer close(recvDone)
+
+	go func() {
+		for {
+			c, err := stream.Recv()
+			select {
+			case recvCh <- recvResult{chunk: c, err: err}:
+			case <-recvDone:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Heartbeat comment frames stop an intermediary closing a connection while
+	// a model is still thinking. Without them a reasoning model that takes
+	// ninety seconds before its first token is indistinguishable, to every
+	// proxy between here and the caller, from a dead connection — and the
+	// console adds two such hops.
+	//
+	// A ticker rather than a timer reset after every frame: an extra comment
+	// during active generation costs one line of text that every SSE client
+	// already ignores, and stopping-draining-resetting a timer around a channel
+	// that may have already fired is a well-known source of subtle bugs. The
+	// cheap imprecision is the better trade.
+	var beat <-chan time.Time
+	if hb := s.opts.StreamHeartbeat; hb > 0 {
+		t := time.NewTicker(hb)
+		defer t.Stop()
+		beat = t.C
+	}
+
 	var firstToken time.Time
 	for {
-		chunk, err := stream.Recv()
+		var res recvResult
+		select {
+		case res = <-recvCh:
+		case <-beat:
+			if err := sw.Comment("keep-alive"); err != nil {
+				// Same meaning as a failed Send below: the client is gone.
+				finish(meter.OutcomeCancelled, err)
+				s.logDisconnect(r, p, att)
+				return
+			}
+			continue
+		}
+
+		chunk, err := res.chunk, res.err
 		if err == io.EOF {
 			break
 		}
@@ -638,6 +841,8 @@ func (s *Server) setEstimatedSavings(w http.ResponseWriter, p *gateway.Prepared)
 	}
 	h := w.Header()
 	h.Set(HeaderSaved, usd(d.EstimatedSaved))
+	h.Set(HeaderCost, usd(d.EstimatedCost))
+	h.Set(HeaderBaselineCost, usd(d.BaselineCost))
 	h.Set(HeaderSavedEstimated, "true")
 	if shadow, ok := d.ShadowSaving(); ok {
 		h.Set(HeaderShadowSaved, usd(shadow))

@@ -230,6 +230,12 @@ func convertEndpoint(e endpointYAML, path string, opts Options, c *collector) *d
 	if e.Limits.ContextWindow <= 0 {
 		c.add(path, "limits.context_window must be positive")
 	}
+	// Expanded before validation, so an unset variable fails the scheme check
+	// below with the literal ${...} in the message rather than dialling
+	// somewhere unintended. This is the only field in the catalog that reads
+	// the environment; see expand.go for why it is the only one.
+	e.BaseURL = expandEnv(e.BaseURL)
+
 	// A base_url without a scheme produces a request that fails at dial time
 	// with an error naming neither the endpoint nor the catalog. Cheaper to
 	// reject the string here, where the file path is still in hand.

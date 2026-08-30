@@ -269,9 +269,15 @@ Two things a week of traffic will settle that a test cannot. Whether the quality
 - Postgres schema and migrations; tenants, API keys (hashed), scopes
 - Admin API for catalog, routes, policies, quality floors, lever configuration
 - Budgets with **reservation semantics**; per-tenant and per-credential rate limits in Redis
-- `CredentialResolver` with a concrete BYOK implementation ([ADR-0004](adr/0004-credential-ownership.md))
+- `CredentialResolver` — **the seam and the request-scoped BYOK path are built; storage is what is left here** ([ADR-0004](adr/0004-credential-ownership.md))
 - Audit log; opt-in prompt capture with redaction and retention
 - Self-hosted packaging and signed catalog snapshot distribution
+
+**What was pulled forward, and what was not.** The third slice taken out of this phase early, after the Phase 2 tenancy registry and the control-plane listener, and taken for the same reason: the alternative was building the console against a seam that did not exist yet and then rebuilding it.
+
+What exists now is the *transport*. `provider.Resolver` has ADR-0004's signature; a caller supplies keys per request on `X-Relay-Credential`; `provider.Chain` resolves caller-supplied credentials ahead of the deployment's environment, so hosted and self-hosted are one code path and the difference between them is dropping a link. Two things had to move with it, neither of which was on this list: routing now filters on credential *availability* rather than on the catalog merely naming a ref, and the response cache isolates on a scope rather than on the tenant — because under BYOK two strangers share the anonymous tenant and would otherwise share each other's answers.
+
+What is still Phase 7 is everything about *storing* a credential: an encrypted per-tenant store, rotation, revocation, and an onboarding flow that validates a key before a customer discovers at request time that it was wrong. A request-scoped key is used and discarded; nothing persists one. "BYOK is done" and "credential storage is done" are different statements and only the first is true.
 
 **Done when:** two tenants with different quality floors and budgets share one deployment, and neither can exceed its budget under concurrent load — the reservation model is the specific thing under test.
 
@@ -322,6 +328,10 @@ Cut with reasons, so the reasons can be revisited rather than re-argued.
 
 **Client SDKs, CLI, VS Code extension, Slack bot.** OpenAI compatibility means these already exist and work. Building them would be building competitors to software the customer already has — and would contradict the one-line-integration promise.
 
-**Frontend dashboard.** Grafana over Prometheus and Postgres covers internal needs until the admin API is stable. The customer-facing savings report in Phase 6 is the exception, because it is the product's proof and cannot be outsourced to a Grafana link.
+**Frontend dashboard — amended, see [ADR-0012](adr/0012-console-as-separate-app.md).** Grafana over Prometheus and Postgres still covers *operator* needs until the admin API is stable, and an operator dashboard remains out of scope. What is now built instead is a **console**, and it is a different artifact for a different audience: not a view of the fleet for the people running it, but the adoption surface for the people evaluating it.
+
+The argument is the one this entry already made for the Phase 6 savings report, extended one step. Relay computes its own central claim on every request — the ranked candidates, each dimension's weighted contribution, every rejection with its reason, both costs — and `X-Relay-Dry-Run` already serializes all of it with no provider call, no credential, no charge and no ledger record. The proof is therefore already free to obtain and impossible to read without `curl` and `jq`. That is the gap the console closes, and it cannot be outsourced to a Grafana link for exactly the reason stated here already.
+
+The cut that stands: the console is never a dependency of the gateway. Relay must build, test, ship and serve traffic with `web/` deleted.
 
 **RAG, vector databases, agent frameworks, workflow orchestration, fine-tuning.** Different products. A gateway that also does these does none of them well.

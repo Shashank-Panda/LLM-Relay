@@ -169,3 +169,53 @@ func TestResolveMode(t *testing.T) {
 		})
 	}
 }
+
+// TestRouteForIsDecidedBySortedName pins the rule that makes adding a route to
+// the shipped catalog safe.
+//
+// routeFor resolves a pinned model to the *first* route by sorted name that
+// declares it as the baseline. That is deliberate — the choice must not vary
+// between two identical requests — but it means a new route sharing an existing
+// baseline silently captures every request that pinned it, changing the
+// candidate set and the weights for traffic nobody intended to touch. The
+// symptom would be a routing change with no configuration change to point at.
+func TestRouteForIsDecidedBySortedName(t *testing.T) {
+	cat := &domain.Catalog{
+		Version:   "v1",
+		Endpoints: map[string]*domain.ModelEndpoint{"p/dear@r": {ID: "p/dear@r"}},
+		Routes: map[string]*domain.Route{
+			"relay/fast-coder":    {Name: "relay/fast-coder", BaselineID: "p/dear@r"},
+			"relay/long-context":  {Name: "relay/long-context", BaselineID: "p/dear@r"},
+			"relay/zero-key-demo": {Name: "relay/zero-key-demo", BaselineID: "p/dear@r"},
+		},
+	}
+	if got := routeFor(cat, "p/dear@r"); got != "relay/fast-coder" {
+		t.Fatalf("routeFor = %q, want relay/fast-coder", got)
+	}
+
+	// And the failure this guards: a name sorting before it takes the traffic.
+	cat.Routes["relay/demo"] = &domain.Route{Name: "relay/demo", BaselineID: "p/dear@r"}
+	if got := routeFor(cat, "p/dear@r"); got != "relay/demo" {
+		t.Fatalf("routeFor = %q; a route sorting first is expected to win, which is "+
+			"exactly why the shipped demo route is named to sort last", got)
+	}
+}
+
+// TestShippedDemoRouteDoesNotCaptureOpus is the same rule applied to the file
+// that actually ships, because the rule above is only useful if someone checks
+// the catalog against it.
+func TestShippedDemoRouteDoesNotCaptureOpus(t *testing.T) {
+	cat := &domain.Catalog{
+		Version:   "v1",
+		Endpoints: map[string]*domain.ModelEndpoint{"anthropic/claude-opus-5@us-east": {ID: "anthropic/claude-opus-5@us-east"}},
+		Routes: map[string]*domain.Route{
+			"relay/fast-coder":    {Name: "relay/fast-coder", BaselineID: "anthropic/claude-opus-5@us-east"},
+			"relay/long-context":  {Name: "relay/long-context", BaselineID: "anthropic/claude-opus-5@us-east"},
+			"relay/zero-key-demo": {Name: "relay/zero-key-demo", BaselineID: "anthropic/claude-opus-5@us-east"},
+		},
+	}
+	if got := routeFor(cat, "anthropic/claude-opus-5@us-east"); got != "relay/fast-coder" {
+		t.Errorf("a direct claude-opus-5 request resolves to %q; adding the demo route "+
+			"must not change where existing traffic goes", got)
+	}
+}

@@ -1,0 +1,12 @@
+.git
+.github
+data
+web/node_modules
+web/.next
+web/out
+*.exe
+relay
+relay-eval
+docs
+README.md
+LICENSE

@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/Shashank-Panda/relay/internal/domain"
@@ -104,7 +105,8 @@ func (e *Executor) degraded(component, reason string) {
 // burns the request deadline before failing anyway. They do not stop the loop —
 // the *next* candidate may well be configured — which is why this returns an
 // error the caller treats as RetryOther rather than one it surfaces.
-func (e *Executor) prepare(cat *domain.Catalog, endpointID string) (*domain.ModelEndpoint, provider.Adapter, provider.Credential, error) {
+func (e *Executor) prepare(ctx context.Context, r *run, endpointID string) (*domain.ModelEndpoint, provider.Adapter, provider.Credential, error) {
+	cat := r.in.Catalog
 	ep, ok := cat.Endpoint(endpointID)
 	if !ok {
 		return nil, nil, provider.Credential{}, &provider.Error{
@@ -122,14 +124,34 @@ func (e *Executor) prepare(cat *domain.Catalog, endpointID string) (*domain.Mode
 		}
 	}
 
-	cred, err := e.resolver.Resolve(ep.CredentialRef)
+	cred, err := r.resolver().Resolve(ctx, r.tenant(), ep)
 	if err != nil {
 		// The resolver's message names the missing configuration, never the
 		// secret. That is a property of provider.ErrNoCredential, not of care
 		// taken here.
+		//
+		// Reported as 401 rather than as the 502 that RetryOther maps to by
+		// default. A missing key is a caller or operator problem with a known
+		// fix, not an upstream failure to wait out, and a 502 sends whoever
+		// receives it looking at the provider's status page. The *class* stays
+		// RetryOther so the loop still moves on to the next candidate — this
+		// changes only what the caller is told if every candidate fails the
+		// same way.
+		status := 0
+		var missing *provider.ErrNoCredential
+		if errors.As(err, &missing) {
+			status = http.StatusUnauthorized
+		}
 		return nil, nil, provider.Credential{}, &provider.Error{
 			Provider: string(ep.Provider), Endpoint: ep.ID,
 			Class: provider.ClassRetryOther, Message: err.Error(),
+			HTTPStatus: status,
+			// Wrapped rather than only stringified, so errors.As can still find
+			// the ErrNoCredential further up. The HTTP layer uses it to add the
+			// remedy that belongs to the transport — "send this header" — which
+			// the resolver cannot know about and the operator-facing "set this
+			// variable" does not cover for a hosted caller.
+			Err: err,
 		}
 	}
 
@@ -205,6 +227,18 @@ type Request struct {
 	// in the existing ranking, which is a worse answer than re-filtering but a
 	// better one than failing.
 	Reroute func(corrected *domain.NormalizedRequest) (*domain.Decision, error)
+
+	// Resolver overrides the executor's own credentials for this request.
+	//
+	// Nil falls back, exactly as Policy does. Non-nil is how a caller-supplied
+	// key reaches the provider call without anything between here and the
+	// adapter having to know that such a thing exists.
+	//
+	// Carried on the request rather than smuggled through the context: a
+	// context.Value holding *behaviour* makes a dependency invisible at the call
+	// site and untypeable at compile time, and this struct already exists to
+	// carry exactly this kind of per-request override.
+	Resolver provider.Resolver
 }
 
 // Run executes a request against its decision's ranked candidates.
@@ -257,6 +291,37 @@ type run struct {
 	// tried remembers endpoints already exhausted, so a reroute that returns a
 	// ranking containing them does not start over on one that just failed.
 	tried map[string]bool
+}
+
+// resolver is the request's own credentials tried ahead of the executor's.
+//
+// A chain rather than a replacement, and the distinction matters: routing
+// filtered on the *union* of what the caller sent and what the deployment
+// holds, so a request that supplied one provider's key may still legitimately
+// be routed to an endpoint whose credential lives in the environment. Replacing
+// instead of chaining would make that request fail on a candidate the router
+// had every reason to believe was reachable.
+//
+// Resolved per run rather than per candidate, so a failover cannot silently
+// change which credentials are in play mid-request.
+func (r *run) resolver() provider.Resolver {
+	switch {
+	case r.in.Resolver == nil:
+		return r.exec.resolver
+	case r.exec.resolver == nil:
+		return r.in.Resolver
+	default:
+		return provider.Chain{r.in.Resolver, r.exec.resolver}
+	}
+}
+
+// tenant is who the credential is being resolved on behalf of. Empty is a valid
+// answer and means the anonymous default.
+func (r *run) tenant() string {
+	if r.in.Request == nil {
+		return ""
+	}
+	return r.in.Request.Tenant
 }
 
 func (r *run) loop(ctx context.Context) (Result, error) {
@@ -327,7 +392,7 @@ const (
 
 // tryEndpoint runs one endpoint's attempts, including its retries.
 func (r *run) tryEndpoint(ctx context.Context, id string) (Result, error, action) {
-	ep, adapter, cred, err := r.exec.prepare(r.in.Catalog, id)
+	ep, adapter, cred, err := r.exec.prepare(ctx, r, id)
 	if err != nil {
 		r.attempts = append(r.attempts, Attempt{
 			EndpointID: id, Class: provider.ClassOf(err), Err: err,

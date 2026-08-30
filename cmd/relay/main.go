@@ -34,24 +34,27 @@ import (
 )
 
 type config struct {
-	addr           string
-	adminAddr      string
-	catalogPath    string
-	tenantsPath    string
-	ledgerPath     string
-	cacheEntries   int
-	cacheMB        int
-	maxPriceAge    time.Duration
-	maxCatalogAge  time.Duration
-	maxInFlight    int
-	maxStreams     int
-	maxPerEndpoint int
-	totalDeadline  time.Duration
-	attemptTimeout time.Duration
-	maxAttempts    int
-	logLevel       string
-	logFormat      string
-	drainTimeout   time.Duration
+	addr            string
+	adminAddr       string
+	catalogPath     string
+	tenantsPath     string
+	ledgerPath      string
+	cacheEntries    int
+	cacheMB         int
+	maxPriceAge     time.Duration
+	maxCatalogAge   time.Duration
+	maxInFlight     int
+	maxStreams      int
+	maxPerEndpoint  int
+	totalDeadline   time.Duration
+	attemptTimeout  time.Duration
+	maxAttempts     int
+	logLevel        string
+	logFormat       string
+	drainTimeout    time.Duration
+	streamHeartbeat time.Duration
+	validate        bool
+	allowInsecure   bool
 }
 
 func main() {
@@ -94,11 +97,22 @@ func run() error {
 		"bounds one call; for streams it bounds opening the stream, never the stream itself")
 	flag.DurationVar(&cfg.totalDeadline, "request-deadline", execute.DefaultPolicy().TotalDeadline,
 		"bounds attempts and backoff for one request")
+	flag.DurationVar(&cfg.streamHeartbeat, "stream-heartbeat", server.DefaultOptions().StreamHeartbeat,
+		"how often to send an SSE comment frame on an idle stream, so proxies do not close it; negative disables")
 	flag.StringVar(&cfg.logLevel, "log-level", "info", "debug | info | warn | error")
 	flag.StringVar(&cfg.logFormat, "log-format", "json", "json | text")
 	flag.DurationVar(&cfg.drainTimeout, "drain-timeout", 30*time.Second,
 		"how long in-flight requests may finish after shutdown begins")
+	flag.BoolVar(&cfg.allowInsecure, "allow-insecure-credentials", false,
+		"accept X-Relay-Credential over plaintext HTTP; a key sent in the clear is "+
+			"a compromised key, and the request carrying it still succeeds")
+	flag.BoolVar(&cfg.validate, "validate", false,
+		"load and check the catalog and tenants, report price-attestation ages, and exit")
 	flag.Parse()
+
+	if cfg.validate {
+		return validate(cfg)
+	}
 
 	log := newLogger(cfg.logLevel, cfg.logFormat)
 
@@ -199,24 +213,32 @@ func run() error {
 		})
 
 	gw := &gateway.Gateway{
-		Store:      store,
-		Executor:   executor,
-		Tenants:    tenants,
-		Stats:      stats,
-		Cache:      cache,
-		Health:     tracker,
-		OnDegraded: degraded,
+		Store:    store,
+		Executor: executor,
+		// The same resolver the executor uses, asked a different question: the
+		// router needs to know which refs *resolve* so it can eliminate an
+		// endpoint the deployment has no key for, rather than rank it and let
+		// the executor find out one paid attempt later.
+		Credentials: resolver,
+		Tenants:     tenants,
+		Stats:       stats,
+		Cache:       cache,
+		Health:      tracker,
+		OnDegraded:  degraded,
 		// The fallback when no tenant registry is configured. Strict: nobody
 		// gets substituted by leaving a file absent.
 		Policy: domain.DefaultPolicy(),
 	}
 
 	srv := server.New(gw, store, registry, server.Options{
-		Logger:  log,
-		Tenants: tenants,
-		Meter:   mtr,
-		Metrics: mx,
-		Admit:   limiter,
+		Logger:          log,
+		Tenants:         tenants,
+		Meter:           mtr,
+		Metrics:         mx,
+		Admit:           limiter,
+		StreamHeartbeat: cfg.streamHeartbeat,
+
+		AllowInsecureCredentials: cfg.allowInsecure,
 	})
 
 	httpSrv := &http.Server{

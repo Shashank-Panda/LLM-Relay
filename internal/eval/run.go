@@ -119,7 +119,10 @@ func (r *Runner) Run(ctx context.Context, s *Suite, ep *domain.ModelEndpoint) (E
 	if err != nil {
 		return EndpointResult{}, fmt.Errorf("eval %s: %w", ep.ID, err)
 	}
-	cred, err := r.Resolver.Resolve(ep.CredentialRef)
+	// The eval harness is a single-tenant offline tool: it resolves against
+	// whatever the operator running it has configured, which is what the empty
+	// tenant means here.
+	cred, err := r.Resolver.Resolve(ctx, "", ep)
 	if err != nil {
 		return EndpointResult{}, fmt.Errorf("eval %s: %w", ep.ID, err)
 	}

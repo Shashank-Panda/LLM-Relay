@@ -19,6 +19,24 @@ func testOptions() Options {
 	return Options{MaxPriceAge: 90 * 24 * time.Hour, Now: asOf}
 }
 
+// shippedOptions loads config/catalog.yaml as of the wall clock, not the frozen
+// asOf above.
+//
+// The inline fixtures pin a clock so their attestations mean something fixed.
+// The shipped file cannot share it: its attestations are refreshed whenever a
+// human re-checks the providers' pricing pages, and the moment one is dated
+// after asOf the frozen clock rejects it as "in the future" — a green file
+// failing for being too current.
+//
+// MaxPriceAge is effectively disabled here on purpose. Whether the shipped
+// prices have gone stale is a real question, but it belongs to the scheduled
+// freshness job (.github/workflows/catalog-freshness.yml), which runs weekly at
+// a 14-day lead and is allowed to go red on its own. Enforcing it here would
+// instead fail every unrelated pull request the day an attestation aged out.
+func shippedOptions() Options {
+	return Options{MaxPriceAge: 100 * 365 * 24 * time.Hour, Now: time.Now()}
+}
+
 func load(t *testing.T, yaml string) (*domain.Catalog, error) {
 	t.Helper()
 	return Load(strings.NewReader(yaml), testOptions())
@@ -56,7 +74,7 @@ routes:
 // TestLoadShippedCatalog keeps config/catalog.yaml honest. A shipped example
 // that no test loads is an example that silently stops being valid.
 func TestLoadShippedCatalog(t *testing.T) {
-	cat, err := LoadFile(filepath.Join("..", "..", "config", "catalog.yaml"), testOptions())
+	cat, err := LoadFile(filepath.Join("..", "..", "config", "catalog.yaml"), shippedOptions())
 	if err != nil {
 		t.Fatalf("LoadFile: %v", err)
 	}
@@ -67,23 +85,53 @@ func TestLoadShippedCatalog(t *testing.T) {
 	if len(cat.Endpoints) != 5 {
 		t.Errorf("loaded %d endpoints, want 5", len(cat.Endpoints))
 	}
-	if len(cat.Routes) != 2 {
-		t.Errorf("loaded %d routes, want 2", len(cat.Routes))
+	if len(cat.Routes) != 3 {
+		t.Errorf("loaded %d routes, want 3", len(cat.Routes))
 	}
+
+	// The zero-key demo route is what lets someone watch substitution work
+	// without buying anything first, so its shape is asserted rather than
+	// assumed: a free candidate, an expensive baseline, and no requirement the
+	// free candidate cannot meet.
+	t.Run("the zero-key demo route stays servable without a credential", func(t *testing.T) {
+		rt, ok := cat.Route("relay/zero-key-demo")
+		if !ok {
+			t.Fatal("relay/zero-key-demo is missing; the keyless demo is gone")
+		}
+		if len(rt.Require) != 0 {
+			t.Errorf("route declares %d requirements; the local endpoint has no "+
+				"capabilities beyond streaming and cannot clear them", len(rt.Require))
+		}
+		local, ok := cat.Endpoint("ollama/qwen-coder@local")
+		if !ok {
+			t.Fatal("ollama/qwen-coder@local is missing")
+		}
+		if local.Pricing.Input != 0 || local.Pricing.Output != 0 {
+			t.Errorf("the local endpoint is priced %d/%d; the demo depends on it being free",
+				local.Pricing.Input, local.Pricing.Output)
+		}
+		var found bool
+		for _, id := range rt.Candidates {
+			found = found || id == local.ID
+		}
+		if !found {
+			t.Error("the free endpoint is not a candidate on its own demo route")
+		}
+	})
 
 	t.Run("dollars become integer micro-dollars", func(t *testing.T) {
 		sonnet, ok := cat.Endpoint("anthropic/claude-sonnet-5@us-east")
 		if !ok {
 			t.Fatal("sonnet missing")
 		}
-		if got := sonnet.Pricing.Input; got != 3_000_000 {
-			t.Errorf("input rate = %d, want 3000000", got)
+		if got := sonnet.Pricing.Input; got != 2_000_000 {
+			t.Errorf("input rate = %d, want 2000000", got)
 		}
-		if got := sonnet.Pricing.Output; got != 15_000_000 {
-			t.Errorf("output rate = %d, want 15000000", got)
+		if got := sonnet.Pricing.Output; got != 10_000_000 {
+			t.Errorf("output rate = %d, want 10000000", got)
 		}
-		if got := sonnet.Pricing.CachedInput; got != 300_000 {
-			t.Errorf("cached input rate = %d, want 300000", got)
+		if got := sonnet.Pricing.CachedInput; got != 200_000 {
+			t.Errorf("cached input rate = %d, want 200000", got)
 		}
 	})
 
@@ -136,7 +184,7 @@ func TestLoadShippedCatalog(t *testing.T) {
 // TestShippedCatalogRoutes wires the loader to the router, which is the only
 // way to know the file describes a catalog that can actually serve a request.
 func TestShippedCatalogRoutes(t *testing.T) {
-	cat, err := LoadFile(filepath.Join("..", "..", "config", "catalog.yaml"), testOptions())
+	cat, err := LoadFile(filepath.Join("..", "..", "config", "catalog.yaml"), shippedOptions())
 	if err != nil {
 		t.Fatalf("LoadFile: %v", err)
 	}
@@ -164,8 +212,12 @@ func TestShippedCatalogRoutes(t *testing.T) {
 	if !d.SavingMeasured {
 		t.Error("SavingMeasured = false; the route declares a baseline")
 	}
-	if d.BaselineCost != 232_500 {
-		t.Errorf("BaselineCost = %s, want $0.232500", d.BaselineCost)
+	// 8000 input x $5/MTok + 1500 output x $25/MTok = $0.040 + $0.0375.
+	// Spelled out because this number is the denominator of every saving the
+	// product reports: if the shipped price for the baseline changes, this is
+	// the assertion that should force somebody to look at it deliberately.
+	if d.BaselineCost != 77_500 {
+		t.Errorf("BaselineCost = %s, want $0.077500", d.BaselineCost)
 	}
 	// qwen-coder lacks tool support and must not survive the filter.
 	for _, c := range d.Ranked {

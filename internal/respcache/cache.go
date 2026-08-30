@@ -18,13 +18,13 @@ import (
 // caller asked for — and it keeps a vendor's wire format out of a structure that
 // outlives the request that produced it.
 type Entry struct {
-	// Tenant and Endpoint are re-checked on read.
+	// Scope and Endpoint are re-checked on read.
 	//
 	// Both are already inside the key, so this is redundant by design. A
 	// SHA-256 collision is not a realistic threat; a bug in key construction is,
 	// and the consequence of that bug is a cross-tenant prompt disclosure. The
 	// cheap check that turns a breach into a miss is worth keeping.
-	Tenant   string
+	Scope    string
 	Endpoint string
 
 	ProviderID   string
@@ -126,12 +126,12 @@ func New(opts Options) *Store {
 	}
 }
 
-// Get returns a live entry for this key, tenant, and endpoint.
+// Get returns a live entry for this key, scope, and endpoint.
 //
-// The tenant and endpoint arguments are not conveniences — they are the
-// second half of the cross-tenant guarantee. A caller that has only a key
-// cannot read anything out of this store.
-func (s *Store) Get(key, tenant, endpointID string) (*Entry, bool) {
+// The scope and endpoint arguments are not conveniences — they are the second
+// half of the isolation guarantee. A caller that has only a key cannot read
+// anything out of this store.
+func (s *Store) Get(key, scope, endpointID string) (*Entry, bool) {
 	if s == nil || key == "" {
 		return nil, false
 	}
@@ -157,7 +157,7 @@ func (s *Store) Get(key, tenant, endpointID string) (*Entry, bool) {
 		return nil, false
 	}
 
-	if it.entry.Tenant != tenant || it.entry.Endpoint != endpointID {
+	if it.entry.Scope != scope || it.entry.Endpoint != endpointID {
 		// Should be unreachable: both are inside the key. If it ever fires, the
 		// key derivation has a bug, and this counter is how that gets noticed
 		// before a customer notices it instead.
@@ -273,7 +273,7 @@ func (s *Store) Stats() Stats {
 // enough to keep the heap bounded, and the alternative is reflection on the hot
 // path to compute a number that only feeds an inequality.
 func (e *Entry) size() int {
-	n := len(e.Tenant) + len(e.Endpoint) + len(e.ProviderID) + 128
+	n := len(e.Scope) + len(e.Endpoint) + len(e.ProviderID) + 128
 	for _, p := range e.Parts {
 		n += len(p.Text) + len(p.Arguments) + len(p.ToolName) + len(p.ToolCallID) +
 			len(p.URL) + len(p.Data) + len(p.MediaType) + 64
@@ -292,6 +292,18 @@ const (
 	ReasonNoCacheHeader   Reason = "the request asked to bypass the cache"
 	ReasonPinnedStrict    Reason = "X-Relay-Pin: strict requires a live provider call"
 	ReasonNoTenantOrRoute Reason = "no tenant or endpoint to scope the entry to"
+
+	// ReasonAnonymousBYOK declines to cache when a request supplied its own
+	// provider credentials but no isolation principal could be derived from
+	// them.
+	//
+	// Declining rather than guessing. The alternative is to fall back to the
+	// tenant, and under caller-supplied credentials the tenant is not the
+	// security boundary: two strangers can present the same tenant id — the
+	// anonymous default — while holding different keys, and a shared entry
+	// between them is one person's answer, generated on their key, served to
+	// somebody else along with confirmation of what they asked.
+	ReasonAnonymousBYOK Reason = "request-supplied credentials with no derivable cache principal"
 )
 
 // Cacheable decides whether a request may read from or write to the cache.

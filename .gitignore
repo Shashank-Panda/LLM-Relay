@@ -8,3 +8,16 @@
 /relay.exe
 /relay-eval
 /relay-eval.exe
+
+# Provider credentials. .env.example says to copy this file and fill it in, so
+# it will hold live keys on any machine where anyone followed the instructions.
+.env
+.env.local
+
+# The console's dependencies and build output. web/.gitignore covers these too;
+# they are repeated here so a checkout without that file still refuses them.
+/web/node_modules/
+/web/.next/
+/web/out/
+
+/graphify-out

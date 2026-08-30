@@ -7,13 +7,15 @@ One decision per file. Each records what was decided, why, and what it costs —
 | [0001](0001-model-endpoint-as-routing-unit.md) | The routing unit is a model endpoint, not a provider | Accepted |
 | [0002](0002-virtual-models-and-routing-contract.md) | Virtual models carry routing intent through the `model` field | Accepted — amended by 0007 |
 | [0003](0003-streaming-failover-semantics.md) | Failover is permitted only before the first byte | Accepted |
-| [0004](0004-credential-ownership.md) | Who owns provider API keys | **Open** — narrowed to BYOK |
+| [0004](0004-credential-ownership.md) | Who owns provider API keys | Accepted (BYOK) — storage still **open** |
 | [0005](0005-state-store-and-multi-instance.md) | Where state lives, and what is per-process | Accepted |
 | [0006](0006-classifier-placement.md) | The classifier is a scorer input, not a pipeline stage | Accepted |
 | [0007](0007-requested-model-as-baseline.md) | The requested model is a baseline and ceiling, not a pin | Accepted |
 | [0008](0008-request-optimization.md) | Request optimization is a component separate from routing | Accepted |
 | [0009](0009-quality-floor-and-cascade.md) | Quality is a hard floor, protected by sequential escalation | Accepted |
 | [0010](0010-fail-open-availability.md) | Relay fails open to passthrough | Accepted |
+| [0011](0011-license.md) | Relay is licensed Apache-2.0 | Accepted |
+| [0012](0012-console-as-separate-app.md) | The console is a separate Next.js app that proxies to Relay | Accepted |
 
 **Statuses:** Proposed · Accepted · **Open** (deliberately undecided, with a seam preserved) · Amended · Superseded
 

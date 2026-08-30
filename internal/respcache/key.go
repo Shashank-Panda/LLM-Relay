@@ -38,7 +38,13 @@ import (
 // information than the new code assumes, and reusing them would serve an answer
 // whose inputs nobody checked. Cheaper to throw a cache away than to reason
 // about what a stale key means.
-const keySchema = "relay/respcache/v1"
+//
+// v2 changed what field two *means* — from the tenant to a cache scope, which
+// is the tenant plus, under caller-supplied credentials, a principal derived
+// from the key material. Redefining a field is a stronger reason to invalidate
+// than adding one: entries written under v1 are keyed on an isolation boundary
+// that no longer matches the one being enforced.
+const keySchema = "relay/respcache/v2"
 
 // Key derives the cache key for a request as it will actually be sent.
 //
@@ -51,11 +57,14 @@ const keySchema = "relay/respcache/v1"
 // Deliberately excluded: the stream flag, because a stored answer is replayed
 // either way; the request ID; and User/Metadata, which are the customer's own
 // analytics labels and do not reach the model.
-func Key(tenant, endpointID string, req *domain.NormalizedRequest) string {
+// scope, not tenant: two callers can share a tenant id and not share a
+// credential, which is exactly the situation BYOK creates and the situation in
+// which a shared entry is a disclosure rather than a hit.
+func Key(scope, endpointID string, req *domain.NormalizedRequest) string {
 	h := sha256.New()
 
 	field(h, keySchema)
-	field(h, tenant)
+	field(h, scope)
 	field(h, endpointID)
 
 	// System, messages, and tools are the prompt. Order is significant in all

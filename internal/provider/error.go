@@ -56,7 +56,10 @@ func (e *Error) Error() string {
 		b.WriteString(": ")
 		b.WriteString(e.Message)
 	}
-	if e.Err != nil {
+	// Skipped when it would repeat Message verbatim. Both fields are set when a
+	// wrapped error is also the whole of the description — a missing credential,
+	// say — and printing it twice makes the useful half harder to find.
+	if e.Err != nil && e.Err.Error() != e.Message {
 		b.WriteString(": ")
 		b.WriteString(e.Err.Error())
 	}

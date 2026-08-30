@@ -21,6 +21,7 @@ type filterCtx struct {
 	route        *domain.Route
 	policy       *domain.Policy
 	health       *domain.Health
+	creds        *domain.CredentialSet
 	mode         domain.BaselineMode
 	baselineCost domain.Money
 	hasBaseline  bool
@@ -93,6 +94,23 @@ func filter(c filterCtx, ids []string, cat *domain.Catalog) ([]candidate, []doma
 
 		if ep.CredentialRef == "" {
 			reject(id, domain.RejectNoCredential, "no credential configured for this endpoint")
+			continue
+		}
+
+		// Not merely "the catalog names a ref" but "that ref resolves for this
+		// caller". Under BYOK those are different questions, and answering only
+		// the first ranks endpoints the caller cannot authenticate to above the
+		// ones they can — after which the executor discovers the truth one paid
+		// attempt at a time, each classified RetryOther and each consuming a
+		// slot from the request's attempt budget.
+		//
+		// Placed here, beside the check it completes, so the ordering comment
+		// above stays true: an absent credential is a permission fact, not a
+		// transient one, and it should not be reported as though the endpoint
+		// were merely unhealthy.
+		if !c.creds.Has(ep.CredentialRef) {
+			reject(id, domain.RejectNoCredential,
+				"no credential available for "+ep.CredentialRef)
 			continue
 		}
 

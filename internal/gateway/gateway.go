@@ -45,10 +45,61 @@ type Gateway struct {
 	// mean "route normally", never "refuse to route" (ADR-0010).
 	Health *healthpkg.Tracker
 
+	// Credentials answers which credential refs are usable, so the router can
+	// eliminate an endpoint the caller has no key for instead of ranking it and
+	// letting the executor discover the same thing one paid attempt later.
+	//
+	// Nil means "do not filter on credentials" — the behaviour every deployment
+	// had before this existed, and the fail-open direction (ADR-0010).
+	Credentials provider.Resolver
+
 	// OnDegraded counts each fail-open path taken. Nil is safe and is how the
 	// degradations become invisible, which is the specific failure ADR-0010
 	// exists to prevent — so production wires it and tests may not.
 	OnDegraded func(component, reason string)
+}
+
+// CredentialSnapshot reports which of the catalog's credential refs can be
+// resolved right now.
+//
+// Called before Prepare rather than inside it, and that placement is the point:
+// Prepare documents itself as performing no I/O, and a credential store — which
+// is what a hosted deployment resolves against — makes that a real query. Taking
+// the snapshot outside keeps both Prepare and routing.Route pure functions over
+// their arguments, and puts the one piece of latency somewhere an operator can
+// find it.
+//
+// extra is the request's own credentials, tried ahead of the gateway's. It is
+// nil today and is the seam BYOK arrives through.
+//
+// Returns nil — meaning "no opinion", which eliminates nothing — when there is
+// nothing to ask. Refusing to route because credential availability is unknown
+// would be failing closed on our own telemetry.
+func (g *Gateway) CredentialSnapshot(ctx context.Context, cat *domain.Catalog, tenantID string, extra provider.Resolver) *domain.CredentialSet {
+	if cat == nil || (g.Credentials == nil && extra == nil) {
+		return nil
+	}
+	refs := cat.CredentialRefs()
+	if len(refs) == 0 {
+		return nil
+	}
+
+	var available []string
+	if extra != nil {
+		available = provider.AvailableRefs(ctx, extra, tenantID, refs)
+	}
+	if g.Credentials != nil {
+		have := make(map[string]bool, len(available))
+		for _, r := range available {
+			have[r] = true
+		}
+		for _, r := range provider.AvailableRefs(ctx, g.Credentials, tenantID, refs) {
+			if !have[r] {
+				available = append(available, r)
+			}
+		}
+	}
+	return domain.NewCredentialSet(available...)
 }
 
 func (g *Gateway) degraded(component, reason string) {
@@ -159,6 +210,23 @@ type Prepared struct {
 	// have consumed. It is what makes the saving computable, since no provider
 	// reported anything this time.
 	CachedUsage provider.Usage
+
+	// Credentials is what this caller can actually resolve — held for the
+	// dry-run explanation, and reported even when routing was told to ignore it.
+	// Refs only; this never holds a secret.
+	Credentials *domain.CredentialSet
+
+	// requestCreds is what the caller supplied on this request, as opposed to
+	// the deployment's own. Unexported: it holds live provider keys, and the
+	// only things that may read it are the executor, which needs to make the
+	// call, and CacheScope, which needs to isolate on it.
+	requestCreds *provider.KeySet
+
+	// AssumedCredentials records that the ranking above was computed as though
+	// every credential existed. True only on a dry run, and the explanation has
+	// to say so: a ranking that assumed keys the reader does not hold is a
+	// different claim from one that did not.
+	AssumedCredentials bool
 }
 
 // Prepare optimizes the request and routes it.
@@ -174,7 +242,43 @@ type Prepared struct {
 // will actually be sent, because an optimizer that lowers max_tokens changes
 // which endpoints the request fits in. Routing against the pre-optimization
 // request would eliminate candidates the optimizer had just made viable.
-func (g *Gateway) Prepare(req *domain.NormalizedRequest, tn *tenant.Tenant, model, pin string) (*Prepared, error) {
+// PrepareOptions carries the per-request inputs that are not the request.
+//
+// A struct rather than more positional parameters: Prepare was already at four
+// strings, and the next two additions are a boolean and a credential set, which
+// is precisely the shape that produces a call nobody can read and an argument
+// swap nobody notices.
+type PrepareOptions struct {
+	// Model is the caller's requested model, echoed back verbatim.
+	Model string
+
+	// Pin is the X-Relay-Pin header. strict and shadow are honoured; optimize
+	// is not, because permission to substitute belongs to the tenant.
+	Pin string
+
+	// Credentials is which credential refs this request can use. Nil means "do
+	// not filter on credentials", which is the behaviour every deployment had
+	// before this existed.
+	Credentials *domain.CredentialSet
+
+	// RequestCredentials is what the caller supplied on this request, if
+	// anything. It is tried ahead of the deployment's own credentials, and its
+	// presence narrows the response cache's isolation scope — see CacheScope,
+	// where the reason is that under caller-supplied keys the tenant stops being
+	// the security boundary.
+	RequestCredentials *provider.KeySet
+
+	// AssumeCredentials routes as though every credential were available.
+	//
+	// This exists for one caller — a dry run — and must never be set on a live
+	// request. Routing to an endpoint Relay cannot authenticate to would turn an
+	// explanation feature into an outage. The HTTP layer gates it; this field
+	// only carries the decision.
+	AssumeCredentials bool
+}
+
+func (g *Gateway) Prepare(req *domain.NormalizedRequest, tn *tenant.Tenant, opts PrepareOptions) (*Prepared, error) {
+	model, pin := opts.Model, opts.Pin
 	cat := g.Store.Current()
 	if cat == nil {
 		return nil, &ErrUnknownModel{Model: model}
@@ -219,6 +323,7 @@ func (g *Gateway) Prepare(req *domain.NormalizedRequest, tn *tenant.Tenant, mode
 		Tenant:         tn,
 		PinnedStrict:   pinned,
 		Policy:         pol,
+		requestCreds:   opts.RequestCredentials,
 	}
 	if rt, ok := cat.Route(routeName); ok {
 		p.Route = rt
@@ -237,6 +342,22 @@ func (g *Gateway) Prepare(req *domain.NormalizedRequest, tn *tenant.Tenant, mode
 	// The router sees a projection with no message content. That boundary is
 	// what makes a Decision a complete record of why an endpoint was chosen —
 	// a decision that depended on prompt text could not be replayed from one.
+	// Nil under AssumeCredentials, which is what makes a keyless dry run still
+	// produce a full ranking: a nil set has no opinion and eliminates nothing.
+	// The dry-run response reports separately which refs the caller actually
+	// holds, so the explanation stays complete without becoming misleading.
+	// Prepared.Credentials always holds what the caller *actually* has, even
+	// when routing was told to ignore it. The explanation needs both facts: the
+	// ranking is over the whole catalog, and the reader still has to be told
+	// which rows they could act on.
+	p.Credentials = opts.Credentials
+	p.AssumedCredentials = opts.AssumeCredentials
+
+	routeCreds := opts.Credentials
+	if opts.AssumeCredentials {
+		routeCreds = nil
+	}
+
 	d, err := routing.Route(routing.Input{
 		Request: p.Request.RoutingView(),
 		Catalog: cat,
@@ -244,7 +365,8 @@ func (g *Gateway) Prepare(req *domain.NormalizedRequest, tn *tenant.Tenant, mode
 		// Endpoints with an open breaker are eliminated during filtering rather
 		// than failed during execution, so the recorded ranking stays honest
 		// about what was actually available at decision time.
-		Health: g.Health.Snapshot(),
+		Health:      g.Health.Snapshot(),
+		Credentials: routeCreds,
 	})
 	if err != nil {
 		return nil, err
@@ -290,7 +412,72 @@ func (p *Prepared) resolveCacheKey(store *respcache.Store) {
 		p.CacheSkip = reason
 		return
 	}
-	p.CacheKey = respcache.Key(p.TenantID(), p.Decision.Chosen, p.Request)
+
+	scope := p.CacheScope()
+	if scope == "" {
+		p.CacheSkip = respcache.ReasonAnonymousBYOK
+		return
+	}
+	p.CacheKey = respcache.Key(scope, p.Decision.Chosen, p.Request)
+}
+
+// cachePrincipalSchema versions the principal derivation below, independently
+// of the key schema, so either can change without the other.
+const cachePrincipalSchema = "relay/cache-principal/v1"
+
+// CacheScope is the response cache's unit of isolation.
+//
+// Normally the tenant, which is what it has always been and remains correct for
+// a deployment whose credentials come from its own environment: everyone sharing
+// a tenant is, by construction, the same customer.
+//
+// Under caller-supplied credentials that stops being true, and the failure is
+// severe. Two strangers evaluating a hosted Relay both authenticate as the
+// anonymous default tenant and both bring their own provider keys. Same tenant,
+// same endpoint, same prompt — so the same key, and a hit. One of them receives
+// an answer generated on somebody else's credential, together with confirmation
+// that the other person asked that exact question.
+//
+// The existing guard is one condition short of catching it: Cacheable already
+// refuses an *empty* tenant, with a comment saying an unscoped entry is exactly
+// the cross-tenant hit this package must be unable to produce — but "default" is
+// not empty, so it passes. The intent was right and the check could not see the
+// case.
+//
+// So the scope narrows to the tenant plus a principal derived from the key
+// material actually presented. The principal is a truncated salted digest: never
+// the key, never reversible into one, never logged, and never placed in the
+// dry-run body. It exists only to make two different credential holders hash
+// differently.
+func (p *Prepared) CacheScope() string {
+	tid := p.TenantID()
+	if p.requestCreds == nil {
+		return tid
+	}
+	principal := p.requestCreds.Principal(cachePrincipalSchema)
+	if principal == "" {
+		// Credentials were supplied but nothing could be derived from them.
+		// Decline rather than fall back to the tenant, which is precisely the
+		// boundary that does not hold here.
+		return ""
+	}
+	return tid + "\x00" + principal
+}
+
+// credentialResolver is the chain this request resolves credentials through.
+//
+// Nil when the caller supplied nothing, so the executor falls back to its own —
+// which keeps this change additive rather than a migration.
+func (p *Prepared) credentialResolver() provider.Resolver {
+	if p.requestCreds == nil {
+		return nil
+	}
+	// Deliberately *not* including the deployment's own resolver here: the
+	// executor already falls back to it when this returns nil, and building a
+	// chain would require this layer to hold a reference to it. The chain that
+	// matters — caller first, environment second — is assembled in cmd/relay,
+	// where both halves are already in scope.
+	return p.requestCreds
 }
 
 // TenantID is the identifier every ledger entry is filed under.
@@ -424,6 +611,10 @@ func (p *Prepared) executeRequest(streaming bool) execute.Request {
 		Decision:  p.Decision,
 		Streaming: streaming,
 		Reroute:   execute.Rerouter(p.Catalog, p.Policy),
+		// Caller-supplied keys first, the deployment's own second. Nil when the
+		// request brought none, which leaves the executor on its own resolver —
+		// exactly the behaviour every deployment had before BYOK existed.
+		Resolver: p.credentialResolver(),
 	}
 }
 
@@ -546,7 +737,7 @@ func (g *Gateway) cacheGet(p *Prepared) (*respcache.Entry, bool) {
 	if g.Cache == nil || p.CacheKey == "" {
 		return nil, false
 	}
-	return g.Cache.Get(p.CacheKey, p.TenantID(), p.Decision.Chosen)
+	return g.Cache.Get(p.CacheKey, p.CacheScope(), p.Decision.Chosen)
 }
 
 func (g *Gateway) cachePut(
@@ -561,7 +752,7 @@ func (g *Gateway) cachePut(
 		ttl = p.Route.Cache.EffectiveTTL()
 	}
 	g.Cache.Put(p.CacheKey, &respcache.Entry{
-		Tenant:       p.TenantID(),
+		Scope:        p.CacheScope(),
 		Endpoint:     p.Decision.Chosen,
 		ProviderID:   id,
 		Parts:        parts,

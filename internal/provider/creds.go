@@ -1,10 +1,13 @@
 package provider
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/Shashank-Panda/relay/internal/domain"
 )
 
 // Credential is what an adapter needs to authenticate one call.
@@ -51,7 +54,63 @@ func (c Credential) GoString() string { return c.String() }
 // three are this one method, and choosing between them later changes one
 // implementation rather than every adapter.
 type Resolver interface {
-	Resolve(ref string) (Credential, error)
+	// Resolve returns the credential to use for this endpoint on behalf of this
+	// tenant.
+	//
+	// ctx is here because a hosted deployment resolves against a credential
+	// store, and a request that has been cancelled should not go on waiting for
+	// a database. The environment-backed resolvers ignore it.
+	//
+	// The endpoint rather than the bare ref: a stored credential may legitimately
+	// be scoped per deployment or per region, and a ref alone loses both. Callers
+	// must not read anything else off it — nothing above the adapter layer is
+	// allowed to branch on vendor name, and a resolver is above it.
+	Resolve(ctx context.Context, tenant string, ep *domain.ModelEndpoint) (Credential, error)
+}
+
+// Availability answers "could you resolve this ref" without resolving it.
+//
+// Separate from Resolver because the router asks a different question than the
+// executor does, and must not be handed a secret to ask it. The candidate set
+// is decided from refs alone (domain.CredentialSet), so nothing above the
+// executor ever holds key material — a property that is easy to keep now and
+// impossible to recover once lost.
+//
+// A resolver that does not implement this is treated as "has everything", which
+// is the fail-open direction: an unknown availability must not eliminate
+// candidates (ADR-0010).
+type Availability interface {
+	Available(tenant, ref string) bool
+}
+
+// AvailableRefs returns the subset of refs the resolver can supply.
+//
+// Resolvers that cannot answer cheaply are asked the expensive way, once per
+// distinct ref rather than once per candidate — a catalog has a handful of refs
+// and dozens of endpoints.
+func AvailableRefs(ctx context.Context, r Resolver, tenant string, refs []string) []string {
+	if r == nil {
+		return nil
+	}
+	var out []string
+	for _, ref := range refs {
+		if ref == "" {
+			continue
+		}
+		if a, ok := r.(Availability); ok {
+			if a.Available(tenant, ref) {
+				out = append(out, ref)
+			}
+			continue
+		}
+		// A resolver that cannot answer cheaply is asked the expensive way. It
+		// still yields a credential, which is why this function returns refs and
+		// never the value: nothing above the executor should be holding one.
+		if _, err := r.Resolve(ctx, tenant, &domain.ModelEndpoint{CredentialRef: ref}); err == nil {
+			out = append(out, ref)
+		}
+	}
+	return out
 }
 
 // ErrNoCredential is returned when a ref has no configured secret. Distinct
@@ -61,10 +120,25 @@ type Resolver interface {
 type ErrNoCredential struct {
 	Ref    string
 	EnvVar string
+
+	// Hint tells the caller how to supply this credential *here*.
+	//
+	// The env-var form is right for a self-hosted install and wrong for a
+	// hosted one, where it instructs somebody to set a variable on a machine
+	// they do not own. Each resolver states its own remedy rather than the
+	// message assuming a deployment shape.
+	Hint string
 }
 
 func (e *ErrNoCredential) Error() string {
-	return fmt.Sprintf("no credential configured for %q (set %s)", e.Ref, e.EnvVar)
+	hint := e.Hint
+	if hint == "" && e.EnvVar != "" {
+		hint = "set " + e.EnvVar
+	}
+	if hint == "" {
+		return fmt.Sprintf("no credential configured for %q", e.Ref)
+	}
+	return fmt.Sprintf("no credential configured for %q (%s)", e.Ref, hint)
 }
 
 // EnvResolver reads credentials from the environment.
@@ -97,7 +171,26 @@ func (r *EnvResolver) EnvVarFor(ref string) string {
 	return prefix + name
 }
 
-func (r *EnvResolver) Resolve(ref string) (Credential, error) {
+// Available reports whether this ref has a secret, without reading one into a
+// caller's hands.
+func (r *EnvResolver) Available(_, ref string) bool {
+	if ref == "" {
+		return false
+	}
+	if r.Free[ref] {
+		return true
+	}
+	r.mu.RLock()
+	_, cached := r.cached[ref]
+	r.mu.RUnlock()
+	return cached || os.Getenv(r.EnvVarFor(ref)) != ""
+}
+
+func (r *EnvResolver) Resolve(_ context.Context, _ string, ep *domain.ModelEndpoint) (Credential, error) {
+	ref := ""
+	if ep != nil {
+		ref = ep.CredentialRef
+	}
 	if ref == "" {
 		return Credential{}, &ErrNoCredential{Ref: ref, EnvVar: "(none)"}
 	}
@@ -112,7 +205,7 @@ func (r *EnvResolver) Resolve(ref string) (Credential, error) {
 	env := r.EnvVarFor(ref)
 	key := os.Getenv(env)
 	if key == "" && !r.Free[ref] {
-		return Credential{}, &ErrNoCredential{Ref: ref, EnvVar: env}
+		return Credential{}, &ErrNoCredential{Ref: ref, EnvVar: env, Hint: "set " + env}
 	}
 
 	c = Credential{Ref: ref, APIKey: key}
@@ -131,7 +224,17 @@ func (r *EnvResolver) Resolve(ref string) (Credential, error) {
 // mount a secrets file.
 type StaticResolver map[string]Credential
 
-func (s StaticResolver) Resolve(ref string) (Credential, error) {
+// Available reports whether this ref is in the map.
+func (s StaticResolver) Available(_, ref string) bool {
+	_, ok := s[ref]
+	return ok
+}
+
+func (s StaticResolver) Resolve(_ context.Context, _ string, ep *domain.ModelEndpoint) (Credential, error) {
+	ref := ""
+	if ep != nil {
+		ref = ep.CredentialRef
+	}
 	c, ok := s[ref]
 	if !ok {
 		return Credential{}, &ErrNoCredential{Ref: ref, EnvVar: "(static resolver)"}

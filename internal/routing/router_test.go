@@ -339,6 +339,20 @@ func TestFilterReasons(t *testing.T) {
 			},
 		},
 		{
+			// The catalog names a ref, but this caller cannot resolve it. That
+			// is the BYOK case, and answering only the previous question ranks
+			// endpoints the caller cannot authenticate to above the ones they
+			// can — after which the executor discovers the truth one paid
+			// attempt at a time.
+			name:    "credential named but unavailable",
+			subject: epMini,
+			want:    domain.RejectNoCredential,
+			mutate: func(in *Input) {
+				in.Catalog.Endpoints[epMini].CredentialRef = "openai-primary"
+				in.Credentials = domain.NewCredentialSet("anthropic-primary")
+			},
+		},
+		{
 			name:    "circuit open",
 			subject: epSonnet,
 			want:    domain.RejectCircuitOpen,
@@ -521,5 +535,59 @@ func TestBaselineIsAlwaysACandidate(t *testing.T) {
 
 	if d.Chosen != epOpus {
 		t.Errorf("chosen = %s, want baseline %s to have been considered", d.Chosen, epOpus)
+	}
+}
+
+// TestNilCredentialSetKeepsEveryCandidate is the fail-open direction, and the
+// reason this change was additive rather than a migration.
+//
+// A nil set means "nobody asked", not "nobody has any". Routing is not allowed
+// to eliminate candidates because a signal it depends on was never supplied —
+// that is failing closed on our own telemetry, which ADR-0010 forbids, and it
+// would have broken every deployment that had not yet configured one.
+func TestNilCredentialSetKeepsEveryCandidate(t *testing.T) {
+	in := docInput()
+	in.Credentials = nil
+	in.Request.Baseline.Mode = domain.ModeOptimize
+
+	d := mustRoute(t, in)
+
+	if len(d.Ranked) == 0 {
+		t.Fatal("no candidates survived with a nil credential set")
+	}
+	for _, r := range d.Rejected {
+		if r.Reason == domain.RejectNoCredential && r.Detail != "no credential configured for this endpoint" {
+			t.Errorf("%s rejected as %s (%q) with no credential set supplied",
+				r.EndpointID, r.Reason, r.Detail)
+		}
+	}
+}
+
+// TestEmptyCredentialSetIsNotNil pins the distinction the two states carry.
+//
+// NewCredentialSet() with no refs is an assertion that nothing is available and
+// must reject everything; nil is the absence of an assertion and must reject
+// nothing. Conflating them in either direction is a bug with opposite symptoms:
+// one is a gateway that refuses to route, the other is a gateway that ranks
+// endpoints it cannot call.
+func TestEmptyCredentialSetIsNotNil(t *testing.T) {
+	in := docInput()
+	in.Request.Baseline.Mode = domain.ModeOptimize
+	in.Credentials = domain.NewCredentialSet()
+
+	d, err := Route(in)
+	if err == nil && len(d.Ranked) > 0 && d.Ranked[0].Reasons == nil {
+		t.Fatalf("an empty credential set ranked %d candidates; it asserts that "+
+			"none are usable", len(d.Ranked))
+	}
+
+	// Whatever it served, it must not have *ranked* anything as viable.
+	if err == nil {
+		for _, r := range d.Rejected {
+			if r.Reason == domain.RejectNoCredential {
+				return // at least one endpoint was correctly eliminated
+			}
+		}
+		t.Error("no endpoint was rejected for want of a credential")
 	}
 }

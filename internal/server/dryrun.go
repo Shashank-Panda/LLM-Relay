@@ -45,7 +45,8 @@ type dryRunResponse struct {
 	Optimizations []dryRunOptimization `json:"optimizations"`
 	Optimizer     dryRunOptimizer      `json:"optimizer"`
 
-	Cache dryRunCache `json:"cache"`
+	Cache       dryRunCache       `json:"cache"`
+	Credentials dryRunCredentials `json:"credentials"`
 
 	Estimate dryRunEstimate `json:"estimate"`
 
@@ -86,6 +87,28 @@ type dryRunOptimizer struct {
 	ElapsedUS int64  `json:"elapsed_us"`
 	BudgetUS  int64  `json:"budget_us"`
 	Degraded  bool   `json:"degraded,omitempty"`
+}
+
+// dryRunCredentials reports which endpoints the caller could actually reach,
+// separately from which ones routing considered.
+//
+// The two are the same number on a configured deployment and different on a
+// fresh clone, and keeping them apart is what lets one response be both
+// complete and honest: the ranking shows the real arithmetic over the whole
+// catalog, and this says how much of it the reader could act on.
+//
+// Refs, never secrets, and never a prefix of one. This struct is serialized to
+// anybody who can reach the data plane.
+type dryRunCredentials struct {
+	// Assumed records that the ranking above was computed as though every
+	// credential existed, because the request asked for that with
+	// X-Relay-Assume-Credentials: all. A live request never sets it.
+	Assumed bool `json:"assumed"`
+
+	// Available and Missing partition the catalog's credential refs. Missing is
+	// what a UI turns into "paste a key for these to include them".
+	Available []string `json:"available"`
+	Missing   []string `json:"missing"`
 }
 
 type dryRunCache struct {
@@ -151,7 +174,8 @@ func dryRun(p *gateway.Prepared) dryRunResponse {
 			Key:      p.CacheKey,
 			Skipped:  string(p.CacheSkip),
 		},
-		Note: dryRunNote,
+		Credentials: dryRunCredentialsFor(p),
+		Note:        dryRunNote,
 	}
 
 	for _, c := range d.Ranked {
@@ -195,4 +219,41 @@ func tokensOf(r *domain.NormalizedRequest) int {
 		return 0
 	}
 	return r.InputTokens()
+}
+
+// dryRunCredentialsFor partitions the catalog's credential refs into the ones
+// this caller can use and the ones they cannot.
+//
+// A nil CredentialSet means credential filtering is switched off entirely, which
+// is not the same as holding every key — so it reports everything as available
+// and nothing as missing, matching exactly what routing did.
+func dryRunCredentialsFor(p *gateway.Prepared) dryRunCredentials {
+	refs := p.Catalog.CredentialRefs()
+
+	out := dryRunCredentials{
+		Assumed: p.AssumedCredentials,
+		// Never nil: an empty array says "you hold none", a null would say
+		// "this build does not report credentials", and a client that had to
+		// distinguish those would be reading a bug.
+		Available: []string{},
+		Missing:   []string{},
+	}
+
+	// Reported from what the caller actually holds, even under Assumed: routing
+	// ran with no credential opinion, but showing a complete ranking to somebody
+	// who holds none of these keys is only honest if the response also says so.
+	set := p.Credentials
+	if set == nil {
+		out.Available = append(out.Available, refs...)
+		return out
+	}
+
+	for _, r := range refs {
+		if set.Has(r) {
+			out.Available = append(out.Available, r)
+		} else {
+			out.Missing = append(out.Missing, r)
+		}
+	}
+	return out
 }

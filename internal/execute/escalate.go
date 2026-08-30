@@ -94,7 +94,7 @@ func (r *run) escalate(ctx context.Context, res Result) (Result, error) {
 		Usage:      res.Response.Usage,
 	})
 
-	ep, adapter, cred, err := r.exec.prepare(r.in.Catalog, baseline)
+	ep, adapter, cred, err := r.exec.prepare(ctx, r, baseline)
 	if err != nil {
 		// The baseline is unreachable. The downgraded answer is invalid but it
 		// is what exists, and returning it is better than failing a request that

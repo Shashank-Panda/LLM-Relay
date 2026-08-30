@@ -87,3 +87,33 @@ tenants:
         # deletes history; effort downshift overrides a provider default the
         # caller may be relying on. Both are opt-in on their own terms.
         context_pruning: false
+
+  # The demo tenant, and the only one here in optimize mode.
+  #
+  # It exists because substitution is the headline feature and, without a tenant
+  # permitted to use it, no request against this file can demonstrate it at all.
+  # X-Relay-Pin cannot stand in: pinning "optimize" is deliberately not honoured
+  # (gateway.ResolveMode), because permission to serve a model the caller did not
+  # ask for belongs to the tenant and a per-request header is not where consent
+  # lives.
+  #
+  # Paired with routes/zero-key-demo in the catalog, this serves a real request
+  # from the free local model against a frontier baseline, so the saving on the
+  # report is measured rather than counterfactual — on a machine holding no
+  # provider credentials at all.
+  #
+  # Key: sk-relay-demo-optimize-0f1e2d3c4b5a   (demo only — rotate before real use)
+  - id: demo
+    name: Demo
+    keys:
+      - 9c2a5d0b4ee3a5e681d894bd73ca547b29235f117b2632599a92fb6a556aded0
+    policy:
+      optimization_mode: optimize
+      # A floor the local model clears (its asserted coding score is 0.55) rather
+      # than one written around it. Present so the constraint is visible in a
+      # dry-run explanation instead of being an unexercised code path.
+      quality_floor:
+        coding: 0.50
+      max_cost_per_request_usd: 1.00
+      levers:
+        preset: recommended

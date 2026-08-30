@@ -26,9 +26,15 @@ type Options struct {
 	// memory cost it exists to prevent.
 	MaxBodyBytes int64
 
-	// StreamHeartbeat is how often a comment frame is sent while waiting for
-	// the provider's first token, to stop intermediaries closing the
-	// connection. Zero disables it.
+	// StreamHeartbeat is how often an SSE comment frame is sent while a stream
+	// is open but producing nothing, to stop intermediaries closing a
+	// connection that is merely waiting on a slow model.
+	//
+	// Zero means unset and takes DefaultOptions' value; a negative duration
+	// disables it. That asymmetry is deliberate — the default has to be on,
+	// because a reasoning model thinking for ninety seconds is indistinguishable
+	// from a dead connection to every proxy in the path, and the failure looks
+	// like a truncated answer rather than like a timeout.
 	StreamHeartbeat time.Duration
 
 	Logger *slog.Logger
@@ -44,6 +50,14 @@ type Options struct {
 
 	// Metrics is the Prometheus instrumentation. Nil disables it.
 	Metrics *metrics.Metrics
+
+	// AllowInsecureCredentials permits X-Relay-Credential over plaintext HTTP.
+	//
+	// Off by default: a provider key sent in the clear is a compromised key, and
+	// the request carrying it succeeds, so nothing else in the system would ever
+	// report that it happened. On for a local deployment, where the alternative
+	// is asking someone to terminate TLS to try a demo.
+	AllowInsecureCredentials bool
 
 	// Admit bounds concurrent work. Nil admits everything, which is Phase 1's
 	// behaviour: correct for a single-tenant test deployment and not something
@@ -86,6 +100,13 @@ func New(gw *gateway.Gateway, store *catalog.Store, registry *provider.Registry,
 	}
 	if opts.Logger == nil {
 		opts.Logger = d.Logger
+	}
+	// Zero means "unset", not "disabled". A caller that genuinely wants no
+	// heartbeat passes a negative duration, because defaulting a zero to off
+	// would make an unconfigured server silently drop long streams behind any
+	// proxy with an idle timeout — which is every proxy.
+	if opts.StreamHeartbeat == 0 {
+		opts.StreamHeartbeat = d.StreamHeartbeat
 	}
 
 	s := &Server{

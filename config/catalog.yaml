@@ -28,11 +28,11 @@ endpoints:
       context_window: 200000
       max_output_tokens: 64000
     pricing:
-      input: 15.00
-      cached_input: 1.50
-      output: 75.00
-      source: https://www.anthropic.com/pricing
-      verified_on: 2026-08-01
+      input: 5.00
+      cached_input: 0.50
+      output: 25.00
+      source: https://platform.claude.com/docs/en/about-claude/pricing
+      verified_on: 2026-08-23
     quality:
       coding: 0.95
       reasoning: 0.96
@@ -56,11 +56,11 @@ endpoints:
       context_window: 200000
       max_output_tokens: 64000
     pricing:
-      input: 3.00
-      cached_input: 0.30
-      output: 15.00
-      source: https://www.anthropic.com/pricing
-      verified_on: 2026-08-01
+      input: 2.00
+      cached_input: 0.20
+      output: 10.00
+      source: https://platform.claude.com/docs/en/about-claude/pricing
+      verified_on: 2026-08-23
     quality:
       coding: 0.88
       reasoning: 0.90
@@ -86,8 +86,8 @@ endpoints:
       input: 0.15
       cached_input: 0.075
       output: 0.60
-      source: https://openai.com/api/pricing/
-      verified_on: 2026-08-01
+      source: https://developers.openai.com/api/docs/pricing
+      verified_on: 2026-08-23
     quality:
       coding: 0.62
       reasoning: 0.60
@@ -98,7 +98,7 @@ endpoints:
 
   - id: google/gemini-flash@us-central
     provider: google
-    model: gemini-flash
+    model: gemini-2.5-flash
     deployment: us-central
     credential_ref: google-primary
     capabilities:
@@ -110,11 +110,11 @@ endpoints:
       context_window: 1000000
       max_output_tokens: 8192
     pricing:
-      input: 0.10
-      cached_input: 0.025
-      output: 0.40
+      input: 0.30
+      cached_input: 0.03
+      output: 2.50
       source: https://ai.google.dev/pricing
-      verified_on: 2026-08-01
+      verified_on: 2026-08-23
     quality:
       coding: 0.60
       reasoning: 0.62
@@ -133,7 +133,11 @@ endpoints:
     # Anything that is not the vendor's public host names it here: a local
     # Ollama, an Azure deployment, a self-hosted vLLM. Adapters supply their
     # own default when this is empty.
-    base_url: http://localhost:11434
+    # The one field in this file read from the environment, so that a laptop, a
+    # container and a CI runner can each point at their own Ollama without a
+    # second copy of the catalog existing — and two catalogs are how two price
+    # tables drift apart. Nothing else here expands; see internal/catalog/expand.go.
+    base_url: ${RELAY_OLLAMA_URL:-http://localhost:11434}
     capabilities:
       streaming: true
     limits:
@@ -206,3 +210,32 @@ routes:
     cache:
       enabled: true
       ttl: 15m
+
+  # The zero-key demo. Everything else in this catalog needs a paid credential,
+  # which makes the product impossible to *watch* work without first buying
+  # something — and the whole argument is that a lot of traffic is easy enough
+  # for a small model, which is a claim best made by serving it.
+  #
+  # Requirements are deliberately weaker than relay/fast-coder rather than the
+  # local endpoint's quality being written up to meet them. Its coding score of
+  # 0.55 comes from cmd/relay-eval and is a measurement; editing a measurement to
+  # make a demo succeed would discredit the demo and everything else priced off
+  # this file. A route for easy traffic served by a small model is an honest
+  # thing to declare, and it is the product's own thesis.
+  #
+  # The name sorts after every other route on purpose. gateway.routeFor resolves
+  # a pinned model to the first route by sorted name that declares it as the
+  # baseline, so a route named before relay/fast-coder and sharing its opus
+  # baseline would silently capture every direct claude-opus-5 request in the
+  # catalog. TestRouteForPrefersFastCoder pins that.
+  - name: relay/zero-key-demo
+    candidates:
+      - anthropic/claude-opus-5@us-east
+      - ollama/qwen-coder@local
+    baseline: anthropic/claude-opus-5@us-east
+    weights:
+      cost: 0.50
+      quality.coding: 0.30
+      latency: 0.20
+    fallback: anthropic/claude-opus-5@us-east
+    max_attempts: 2

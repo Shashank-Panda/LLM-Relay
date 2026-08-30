@@ -187,6 +187,28 @@ func (c *Catalog) Route(name string) (*Route, bool) {
 
 // Validate checks the whole snapshot. Called at load time, never on the hot
 // path: a catalog that reaches the router is one that already passed.
+// CredentialRefs lists every distinct credential_ref in the catalog, sorted.
+//
+// Used to build a CredentialSet: availability is asked once per ref rather than
+// once per endpoint, because a catalog has a handful of refs and dozens of
+// endpoints, and under a store-backed resolver each question is a query.
+func (c *Catalog) CredentialRefs() []string {
+	if c == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(c.Endpoints))
+	out := make([]string, 0, len(c.Endpoints))
+	for _, ep := range c.Endpoints {
+		if ep.CredentialRef == "" || seen[ep.CredentialRef] {
+			continue
+		}
+		seen[ep.CredentialRef] = true
+		out = append(out, ep.CredentialRef)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (c *Catalog) Validate() error {
 	if c == nil {
 		return fmt.Errorf("catalog: nil")

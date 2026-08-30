@@ -32,13 +32,20 @@ func TestCredentialRedacts(t *testing.T) {
 	}
 }
 
+// epFor is the minimal endpoint a resolver needs. Resolvers take the endpoint
+// rather than the bare ref because a stored credential may be scoped per
+// deployment, and nothing here is allowed to read anything else off it.
+func epFor(ref string) *domain.ModelEndpoint {
+	return &domain.ModelEndpoint{ID: "p/m@d", CredentialRef: ref}
+}
+
 func TestEnvResolver(t *testing.T) {
 	t.Setenv("RELAY_CRED_ANTHROPIC_PRIMARY", "sk-test")
 
 	r := &EnvResolver{Free: map[string]bool{"local": true}}
 
 	t.Run("reads the derived variable", func(t *testing.T) {
-		c, err := r.Resolve("anthropic-primary")
+		c, err := r.Resolve(context.Background(), "", epFor("anthropic-primary"))
 		if err != nil {
 			t.Fatalf("Resolve: %v", err)
 		}
@@ -48,13 +55,13 @@ func TestEnvResolver(t *testing.T) {
 	})
 
 	t.Run("a free ref needs no secret", func(t *testing.T) {
-		if _, err := r.Resolve("local"); err != nil {
+		if _, err := r.Resolve(context.Background(), "", epFor("local")); err != nil {
 			t.Errorf("Resolve(local): %v", err)
 		}
 	})
 
 	t.Run("a missing secret names the variable to set", func(t *testing.T) {
-		_, err := r.Resolve("openai-primary")
+		_, err := r.Resolve(context.Background(), "", epFor("openai-primary"))
 		var missing *ErrNoCredential
 		if !errors.As(err, &missing) {
 			t.Fatalf("err = %v, want *ErrNoCredential", err)

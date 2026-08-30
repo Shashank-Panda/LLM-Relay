@@ -1,0 +1,129 @@
+# Relay, end to end, with no API key and nothing to buy.
+#
+#   docker compose up
+#
+# Brings up a local model, the gateway, and the console. The demo tenant runs in
+# optimize mode against relay/zero-key-demo, so a request nominally baselined on
+# a frontier model is served by the free local one and the savings report shows a
+# *measured* saving rather than a counterfactual.
+#
+# GIVE DOCKER AT LEAST 8 GiB. qwen2.5-coder is a 7-billion-parameter model and
+# needs roughly 5-6 GiB resident to load. Below that the download still succeeds,
+# the gateway still routes, the savings arithmetic is still correct -- and the
+# answer never arrives, because the model process is killed the moment it tries
+# to allocate. What you see is:
+#
+#   {"error":{"message":"{\"error\":\"llama-server process has terminated:
+#    signal: killed\"}","type":"api_error","code":"RetrySame"}}
+#
+# That is an out-of-memory kill, not a bug in relay. Docker Desktop grants a
+# fraction of host RAM by default; raise it under Settings > Resources. On Linux
+# the container sees host memory and only a small host needs attention.
+
+name: relay
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # A one-shot pull rather than a line in the relay entrypoint. The download is
+  # gigabytes and slow on a cold cache, and folding it into the gateway's start
+  # would make every restart look like a hung service.
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama: {condition: service_healthy}
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "qwen2.5-coder"]
+    restart: "no"
+    volumes:
+      - ollama-models:/root/.ollama
+
+  relay:
+    build:
+      context: .
+    depends_on:
+      ollama-pull: {condition: service_completed_successfully}
+    environment:
+      # The one catalog field read from the environment. See
+      # internal/catalog/expand.go for why it is the only one.
+      RELAY_OLLAMA_URL: http://ollama:11434
+
+      # Optional. Absent means the paid endpoints are simply unavailable, which
+      # is a supported state: the demo route does not need them. Set them in a
+      # .env file next to this one to bring them into the candidate set.
+      RELAY_CRED_OPENAI_PRIMARY: ${RELAY_CRED_OPENAI_PRIMARY:-}
+      RELAY_CRED_ANTHROPIC_PRIMARY: ${RELAY_CRED_ANTHROPIC_PRIMARY:-}
+    command:
+      - -addr=:8080
+      # Bound to every interface *inside the container* rather than to loopback.
+      #
+      # That is a real weakening of the control the admin listener normally
+      # relies on, and the compensating control is the line below: there is no
+      # `ports:` mapping for 9090, so it is reachable from the console service
+      # over this network and from nowhere else. /savings has no authentication
+      # until Phase 7 and returns every tenant's spend when unscoped, so do NOT
+      # publish it to debug something. Use the `debug` profile at the bottom of
+      # this file, which exists so that need has an answer that is on the record.
+      - -admin-addr=:9090
+      - -catalog=config/catalog.yaml
+      - -tenants=config/tenants.yaml
+      - -ledger=/app/data/ledger.jsonl
+      - -log-format=text
+      # The console reaches the gateway over this private network, in the clear.
+      # A provider key pasted into the Try-live tab crosses that hop, so the
+      # refusal has to be lifted here — and only here. Do not set this on a
+      # deployment reachable from anywhere a key could be observed in transit.
+      - -allow-insecure-credentials
+    ports:
+      - "8080:8080"
+    volumes:
+      # A named volume, not a bind mount: the ledger is opened 0600 by uid 65532
+      # and a host directory owned by anyone else fails at startup.
+      - relay-data:/app/data
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/relay", "-validate"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  console:
+    build:
+      context: ./web
+    depends_on:
+      - relay
+    environment:
+      RELAY_URL: http://relay:8080
+      # Server-side only. Never exposed to the browser, and never given a
+      # NEXT_PUBLIC_ prefix — the console's route handlers are the only thing in
+      # the system that may reach the admin listener.
+      RELAY_ADMIN_URL: http://relay:9090
+      RELAY_DEMO_TENANT_KEY: sk-relay-demo-optimize-0f1e2d3c4b5a
+    ports:
+      - "3000:3000"
+
+  # Publishes the admin listener on the host. Off unless asked for:
+  #   docker compose --profile debug up
+  # Everything it exposes is unauthenticated, including every tenant's spend.
+  admin-debug:
+    profiles: ["debug"]
+    image: alpine/socat:latest
+    depends_on:
+      - relay
+    command: ["TCP-LISTEN:9090,fork,reuseaddr", "TCP:relay:9090"]
+    ports:
+      - "127.0.0.1:9090:9090"
+
+volumes:
+  ollama-models:
+  relay-data:
